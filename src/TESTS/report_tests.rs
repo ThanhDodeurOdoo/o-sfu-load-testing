@@ -1,14 +1,14 @@
 use serde_json::json;
 
 use super::{
-    GITHUB_SUMMARY_LIMIT_BYTES, LoadFailure, RunData, SampleSet, TelemetrySummary, bar,
+    GITHUB_SUMMARY_LIMIT_BYTES, LoadFailure, RunData, SampleSet, TelemetrySummary, chart_axis_max,
     delivery_rate, ensure_summary_size, escape_table, format_mebibytes, parse_samples,
     render_report, validate_artifact_url,
 };
 use crate::{ScenarioResult, ScenarioSpec};
 
 #[test]
-fn report_sorts_workloads_and_uses_one_delivery_scale() -> anyhow::Result<()> {
+fn report_sorts_workloads_and_renders_visual_rates() -> anyhow::Result<()> {
     let large = run(ScenarioSpec::audio_mesh(1, 10, 1)?, None, 0)?;
     let small = run(ScenarioSpec::smoke(1, 50)?, None, 0)?;
 
@@ -21,9 +21,16 @@ fn report_sorts_workloads_and_uses_one_delivery_scale() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("mesh workload is missing"))?;
 
     assert!(smoke_position < mesh_position);
-    assert!(report.contains("[=...............................] 50"));
-    assert!(report.contains("[================================] 4,500"));
-    assert!(report.contains("4,500/s"));
+    assert!(report.contains("```mermaid\nxychart-beta"));
+    assert!(report.contains("title \"Observed receiver deliveries per second\""));
+    assert!(report.contains("x-axis [\"smoke 1r 50p\", \"audio 1x10 1s\"]"));
+    assert!(report.contains("bar [50, 4500]"));
+    assert!(report.contains("title \"Scheduled sender and receiver-observed RTP payload\""));
+    assert!(report.contains("bar [64, 640]"));
+    assert!(report.contains("line [64, 5760]"));
+    assert!(report.contains("accTitle: Observed receiver deliveries per second"));
+    assert!(report.contains("accDescr: Bars compare receiver-observed delivery rates"));
+    assert!(report.contains("| audio-mesh-1x10-1s | 4,500 | 4,500 | 4,500/s |"));
     Ok(())
 }
 
@@ -37,7 +44,8 @@ fn report_marks_delivery_discrepancies_and_send_lag() -> anyhow::Result<()> {
     assert!(report.contains("| FAIL | 1 | 0 | n/a | deadbeef |"));
     assert!(report.contains("Performance samples: **INVALID**"));
     assert!(report.contains("| 37 ms |"));
-    assert!(report.contains("[################################] 99"));
+    assert!(report.contains("bar [99]"));
+    assert!(report.contains("| smoke-2r-50p | 100 | 99 | 99/s |"));
     assert!(report.contains("| smoke-2r-50p | 1 | 0 | 0 | 0 | 0 | 1 |"));
     Ok(())
 }
@@ -111,12 +119,15 @@ not-json
     )?;
 
     assert!(report.contains("| smoke-1r-50p | 3 | 2 | 2,000 ms | yes | yes |"));
-    assert!(report.contains("SFU CPU timeline, common peak scale 100.000%"));
-    assert!(report.contains("smoke-1r-50p +@"));
-    assert!(report.contains(
-        "SFU CPU average\n```text\nsmoke-1r-50p [################################] 75.000%"
-    ));
-    assert!(report.contains("SFU delivery efficiency"));
+    assert!(report.contains("title \"SFU CPU average and peak\""));
+    assert!(report.contains("y-axis \"CPU (%)\" 0 --> 100"));
+    assert!(report.contains("bar [75]"));
+    assert!(report.contains("line [100]"));
+    assert!(report.contains("title \"SFU CPU timeline: smoke-1r-50p\""));
+    assert!(report.contains("x-axis \"sample bucket\" 0 --> 1"));
+    assert!(report.contains("line [50, 100]"));
+    assert!(report.contains("Chart values by sample bucket (CPU %): 0=50, 1=100"));
+    assert!(report.contains("| smoke-1r-50p | 75.000% | 100.000% |"));
     assert!(report.contains("166 deliveries/CPU-s"));
     assert!(report.contains("50 packets/s"));
     assert!(report.contains("160.0 kbit/s"));
@@ -141,14 +152,70 @@ fn telemetry_does_not_infer_cpu_percent_from_ticks() -> anyhow::Result<()> {
         None,
     )?;
 
-    assert!(
-        report.contains(
-            "SFU CPU average\n```text\nsmoke-1r-50p [................................] n/a"
-        )
+    assert!(!report.contains("title \"SFU CPU average and peak\""));
+    assert!(report.contains("| smoke-1r-50p | n/a | n/a |"));
+    assert!(report.contains("| 3.0 MiB | n/a | n/a |"));
+    Ok(())
+}
+
+#[test]
+fn cpu_chart_keeps_scenarios_with_explicit_percent_samples() -> anyhow::Result<()> {
+    let explicit = parse_samples(
+        r#"
+{"elapsedMs":0,"server":{"rssBytes":1}}
+{"elapsedMs":1000,"serverCpuPercentMilli":10000}
+"#,
     );
+    let ticks_only = parse_samples(
+        r#"
+{"elapsedMs":0,"clockTicksPerSecond":100,"server":{"cpuTicks":10,"rssBytes":1,"startTimeTicks":5}}
+{"elapsedMs":1000,"clockTicksPerSecond":100,"server":{"cpuTicks":20,"rssBytes":1,"startTimeTicks":5}}
+"#,
+    );
+    let report = render_runs(
+        vec![
+            run(ScenarioSpec::smoke(1, 50)?, None, 0)?.with_samples(explicit),
+            run(ScenarioSpec::smoke(2, 50)?, None, 0)?.with_samples(ticks_only),
+        ],
+        None,
+    )?;
+
+    assert!(report.contains("title \"SFU CPU average and peak\""));
+    assert!(report.contains("x-axis [\"smoke 1r 50p\"]"));
+    assert!(report.contains("bar [10]"));
+    assert!(report.contains("line [10]"));
     assert!(report.contains(
-        "SFU RSS peak\n```text\nsmoke-1r-50p [################################] 3.0 MiB"
+        "CPU chart requires an interval-weighted average and sampled peak. Omitted scenarios: smoke 2r 50p."
     ));
+    Ok(())
+}
+
+#[test]
+fn cpu_chart_discloses_single_sample_omission() -> anyhow::Result<()> {
+    let samples = parse_samples(r#"{"elapsedMs":0,"serverCpuPercentMilli":10000}"#);
+    let report = render_runs(
+        vec![run(ScenarioSpec::smoke(1, 50)?, None, 0)?.with_samples(samples)],
+        None,
+    )?;
+
+    assert!(!report.contains("title \"SFU CPU average and peak\""));
+    assert!(report.contains(
+        "CPU chart requires an interval-weighted average and sampled peak. Omitted scenarios: smoke 1r 50p."
+    ));
+    assert!(report.contains("title \"SFU CPU timeline: smoke-1r-50p\""));
+    Ok(())
+}
+
+#[test]
+fn scheduled_sender_rate_excludes_receiver_drain_time() -> anyhow::Result<()> {
+    let mut delayed = run(ScenarioSpec::smoke(1, 50)?, None, 0)?;
+    delayed.result.elapsed_ms = 2_000;
+
+    let report = render_runs(vec![delayed], None)?;
+
+    assert!(report.contains("bar [64]"));
+    assert!(report.contains("line [32]"));
+    assert!(report.contains("| 64.0 kbit/s | 32.0 kbit/s |"));
     Ok(())
 }
 
@@ -182,6 +249,31 @@ fn equal_sort_prefixes_still_render_deterministically() -> anyhow::Result<()> {
 }
 
 #[test]
+fn charts_are_omitted_for_unreadable_scenario_counts() -> anyhow::Result<()> {
+    let samples = parse_samples(
+        r#"
+{"elapsedMs":0,"server":{"rssBytes":1}}
+{"elapsedMs":1000,"serverCpuPercentMilli":10000}
+"#,
+    );
+    let mut runs = Vec::new();
+    for packets in 1..=13 {
+        let run = run(ScenarioSpec::smoke(1, packets)?, None, 0)?;
+        runs.push(if packets == 1 {
+            run.with_samples(samples.clone())
+        } else {
+            run
+        });
+    }
+
+    let report = render_runs(runs, None)?;
+
+    assert!(report.contains("Visual charts are omitted when more than 12 scenarios"));
+    assert!(!report.contains("```mermaid"));
+    Ok(())
+}
+
+#[test]
 fn rate_and_rss_formatting_do_not_overflow() -> anyhow::Result<()> {
     let mut maximum = run(ScenarioSpec::smoke(1, 1)?, None, 0)?;
     maximum.result.delivered_packets = u64::MAX;
@@ -189,6 +281,11 @@ fn rate_and_rss_formatting_do_not_overflow() -> anyhow::Result<()> {
 
     assert_eq!(delivery_rate(&maximum.result), u64::MAX);
     assert_eq!(format_mebibytes(u64::MAX), "17592186044415.9 MiB");
+    let report = render_runs(vec![maximum], None)?;
+    assert!(
+        report.contains("chart is omitted because a value exceeds Mermaid's exact-integer range")
+    );
+    assert!(report.contains("18,446,744,073,709,551,615/s"));
     Ok(())
 }
 
@@ -202,9 +299,14 @@ fn github_summary_accepts_exactly_one_mebibyte() {
 }
 
 #[test]
-fn graph_scale_handles_maximum_counters() {
-    assert_eq!(bar(u64::MAX, u64::MAX, '#'), "#".repeat(32));
-    assert_eq!(bar(0, u64::MAX, '#'), ".".repeat(32));
+fn chart_scale_keeps_cpu_headroom_and_zero_range_valid() {
+    let zero = 0;
+    let partial_cpu = 35;
+    let saturated_cpu = 101;
+
+    assert_eq!(chart_axis_max([&zero].into_iter(), 0), 1);
+    assert_eq!(chart_axis_max([&partial_cpu].into_iter(), 100), 100);
+    assert_eq!(chart_axis_max([&saturated_cpu].into_iter(), 100), 120);
 }
 
 #[test]

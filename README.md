@@ -90,9 +90,11 @@ target/release/o-sfu-load-report \
   --output artifacts/summary.md
 ```
 
-The report contains common-scale delivery graphs, packet discrepancy tables
-and separate SFU and generator CPU plus RSS graphs. Raw JSONL and logs remain
-available as workflow artifacts.
+The report embeds native Mermaid charts for observed delivery rate, scheduled
+sender RTP payload versus receiver-observed payload plus SFU CPU average, peak
+and timeline data.
+Tables retain the authoritative counters, packet discrepancies and process
+metrics. Raw JSONL and logs remain available as workflow artifacts.
 
 ## GitHub Actions
 

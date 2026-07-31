@@ -3,24 +3,23 @@ use std::{
     fmt::Write as _,
     fs,
     io::ErrorKind,
-    iter::repeat_n,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, ensure};
 use serde_json::Value;
 
-use crate::{ScenarioResult, ScenarioSpec};
+use crate::{AUDIO_PACKETS_PER_SECOND, ScenarioResult, ScenarioSpec};
 
-const BAR_WIDTH: usize = 32;
-const BAR_WIDTH_U128: u128 = 32;
-const CPU_TIMELINE_WIDTH: usize = 48;
+const CPU_TIMELINE_POINTS: usize = 32;
 const GITHUB_SUMMARY_LIMIT_BYTES: usize = 1024 * 1024;
 const RESULT_LIMIT_BYTES: u64 = 1024 * 1024;
 const SAMPLES_LIMIT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_INPUTS: usize = 256;
+const MAX_CHART_SCENARIOS: usize = 12;
 const MAX_TELEMETRY_SAMPLES: usize = 10_000;
 const MAX_TELEMETRY_ERRORS: usize = 8;
+const MAX_MERMAID_INTEGER: u64 = 9_007_199_254_740_991;
 
 #[derive(Clone)]
 struct RunData {
@@ -64,14 +63,34 @@ struct TelemetrySummary {
     server_ticks_observed: bool,
     rtc_ticks_observed: bool,
     server_cpu_percent_milli: Option<u64>,
+    server_cpu_peak_percent_milli: Option<u64>,
     server_rss_bytes: Option<u64>,
     rtc_cpu_percent_milli: Option<u64>,
     rtc_rss_bytes: Option<u64>,
-    server_cpu_time_ms: Option<u64>,
     deliveries_per_server_cpu_second: Option<u64>,
     forwarded_packets_per_second: Option<u64>,
     egress_payload_bits_per_second: Option<u64>,
     packet_loop_delay_ms: Option<u64>,
+}
+
+enum ChartPlot<'a> {
+    Bar(&'a [u64]),
+    Line(&'a [u64]),
+}
+
+impl ChartPlot<'_> {
+    const fn keyword(&self) -> &'static str {
+        match self {
+            Self::Bar(_) => "bar",
+            Self::Line(_) => "line",
+        }
+    }
+
+    const fn values(&self) -> &[u64] {
+        match self {
+            Self::Bar(values) | Self::Line(values) => values,
+        }
+    }
 }
 
 /// Renders one GitHub job summary from result files or result directories.
@@ -294,10 +313,10 @@ impl TelemetrySummary {
                 server_ticks_observed: false,
                 rtc_ticks_observed: false,
                 server_cpu_percent_milli: None,
+                server_cpu_peak_percent_milli: None,
                 server_rss_bytes: None,
                 rtc_cpu_percent_milli: None,
                 rtc_rss_bytes: None,
-                server_cpu_time_ms: None,
                 deliveries_per_server_cpu_second: None,
                 forwarded_packets_per_second: None,
                 egress_payload_bits_per_second: None,
@@ -317,6 +336,10 @@ impl TelemetrySummary {
             server_cpu_percent_milli: weighted_average(samples, |sample| {
                 sample.server_cpu_percent_milli
             }),
+            server_cpu_peak_percent_milli: samples
+                .iter()
+                .filter_map(|sample| sample.server_cpu_percent_milli)
+                .max(),
             server_rss_bytes: samples
                 .iter()
                 .filter_map(|sample| sample.server_rss_bytes)
@@ -326,10 +349,6 @@ impl TelemetrySummary {
                 .iter()
                 .filter_map(|sample| sample.rtc_rss_bytes)
                 .max(),
-            server_cpu_time_ms: server_cpu_ticks.map(|(ticks, ticks_per_second)| {
-                let milliseconds = u128::from(ticks) * 1_000 / u128::from(ticks_per_second);
-                u64::try_from(milliseconds).unwrap_or(u64::MAX)
-            }),
             deliveries_per_server_cpu_second: server_cpu_ticks.map(|(ticks, ticks_per_second)| {
                 let deliveries = u128::from(delivered_packets) * u128::from(ticks_per_second)
                     / u128::from(ticks);
@@ -550,45 +569,70 @@ fn render_workloads(output: &mut String, runs: &[RunData]) -> Result<()> {
 
 fn render_delivery(output: &mut String, runs: &[RunData]) -> Result<()> {
     writeln!(output, "## Exact delivery\n")?;
-    writeln!(
-        output,
-        "Every bar uses one common scale. Exact values remain authoritative.\n"
-    )?;
-    let maximum = runs
+    let labels = runs
         .iter()
-        .flat_map(|run| {
-            [
-                run.result.plan.expected_deliveries,
-                run.result.delivered_packets,
-            ]
-        })
-        .max()
-        .unwrap_or_default();
-    let label_width = runs
+        .map(|run| chart_label(run.result.scenario))
+        .collect::<Vec<_>>();
+    let delivery_rates = runs
         .iter()
-        .map(|run| scenario_label(run.result.scenario).len())
-        .max()
-        .unwrap_or_default();
-    writeln!(output, "```text")?;
-    for run in runs {
-        let result = &run.result;
-        let label = scenario_label(result.scenario);
-        writeln!(
+        .map(|run| delivery_rate(&run.result))
+        .collect::<Vec<_>>();
+    let scheduled_rates = runs
+        .iter()
+        .map(|run| scheduled_payload_bits_per_second(&run.result) / 1_000)
+        .collect::<Vec<_>>();
+    let observed_rates = runs
+        .iter()
+        .map(|run| delivered_payload_bits_per_second(&run.result) / 1_000)
+        .collect::<Vec<_>>();
+    if runs.len() <= MAX_CHART_SCENARIOS {
+        render_chart(
             output,
-            "{label:label_width$} expected  [{}] {}",
-            bar(result.plan.expected_deliveries, maximum, '='),
-            grouped(result.plan.expected_deliveries)
+            "Observed receiver deliveries per second",
+            "Bars compare receiver-observed delivery rates across scenarios.",
+            &labels,
+            "deliveries/s",
+            0,
+            &[ChartPlot::Bar(&delivery_rates)],
         )?;
+        render_chart(
+            output,
+            "Scheduled sender and receiver-observed RTP payload",
+            "Bars compare scheduled sender RTP payload. The line compares receiver-observed RTP payload.",
+            &labels,
+            "RTP payload kbit/s",
+            0,
+            &[
+                ChartPlot::Bar(&scheduled_rates),
+                ChartPlot::Line(&observed_rates),
+            ],
+        )?;
+    } else {
         writeln!(
             output,
-            "{:label_width$} delivered [{}] {}  {}/s",
-            "",
-            bar(result.delivered_packets, maximum, '#'),
-            grouped(result.delivered_packets),
-            grouped(delivery_rate(result))
+            "Visual charts are omitted when more than {MAX_CHART_SCENARIOS} scenarios are reported.\n"
         )?;
     }
-    writeln!(output, "```\n")?;
+    writeln!(
+        output,
+        "| Scenario | Expected | Delivered | Delivery rate | Scheduled sender payload | Receiver-observed payload | Exact |"
+    )?;
+    writeln!(output, "| --- | ---: | ---: | ---: | ---: | ---: | --- |")?;
+    for run in runs {
+        let result = &run.result;
+        writeln!(
+            output,
+            "| {} | {} | {} | {}/s | {} | {} | {} |",
+            scenario_label(result.scenario),
+            grouped(result.plan.expected_deliveries),
+            grouped(result.delivered_packets),
+            grouped(delivery_rate(result)),
+            format_bits_per_second(scheduled_payload_bits_per_second(result)),
+            format_bits_per_second(delivered_payload_bits_per_second(result)),
+            if run_passed(run) { "PASS" } else { "FAIL" }
+        )?;
+    }
+    writeln!(output)?;
     Ok(())
 }
 
@@ -651,144 +695,129 @@ fn render_telemetry(output: &mut String, runs: &[RunData]) -> Result<()> {
         )?;
     }
     writeln!(output)?;
-    render_cpu_timeline(output, runs)?;
-    render_metric(
-        output,
-        "SFU CPU average",
-        &summaries,
-        |summary| summary.server_cpu_percent_milli,
-        format_cpu_percent,
-    )?;
-    render_metric(
-        output,
-        "SFU CPU time",
-        &summaries,
-        |summary| summary.server_cpu_time_ms,
-        format_milliseconds,
-    )?;
-    render_metric(
-        output,
-        "SFU delivery efficiency",
-        &summaries,
-        |summary| summary.deliveries_per_server_cpu_second,
-        format_delivery_efficiency,
-    )?;
-    render_metric(
-        output,
-        "SFU forwarded packets",
-        &summaries,
-        |summary| summary.forwarded_packets_per_second,
-        format_packets_per_second,
-    )?;
-    render_metric(
-        output,
-        "SFU payload egress",
-        &summaries,
-        |summary| summary.egress_payload_bits_per_second,
-        format_bits_per_second,
-    )?;
-    render_metric(
-        output,
-        "Packet-loop delay peak",
-        &summaries,
-        |summary| summary.packet_loop_delay_ms,
-        format_milliseconds,
-    )?;
-    render_metric(
-        output,
-        "SFU RSS peak",
-        &summaries,
-        |summary| summary.server_rss_bytes,
-        format_mebibytes,
-    )?;
-    render_metric(
-        output,
-        "RTC CPU average",
-        &summaries,
-        |summary| summary.rtc_cpu_percent_milli,
-        format_cpu_percent,
-    )?;
-    render_metric(
-        output,
-        "RTC RSS peak",
-        &summaries,
-        |summary| summary.rtc_rss_bytes,
-        format_mebibytes,
-    )?;
+    if runs.len() <= MAX_CHART_SCENARIOS {
+        let chart_labels = runs
+            .iter()
+            .map(|run| chart_label(run.result.scenario))
+            .collect::<Vec<_>>();
+        render_cpu_overview(output, &summaries, &chart_labels)?;
+        render_cpu_timeline(output, runs)?;
+    }
+    render_metric_table(output, &summaries)?;
     render_telemetry_issues(output, runs)?;
     Ok(())
 }
 
-fn render_cpu_timeline(output: &mut String, runs: &[RunData]) -> Result<()> {
-    let maximum = runs
-        .iter()
-        .filter_map(|run| run.samples.as_ref())
-        .flat_map(|sample_set| sample_set.samples.iter())
-        .filter_map(|sample| sample.server_cpu_percent_milli)
-        .max()
-        .unwrap_or_default();
-    let label_width = runs
-        .iter()
-        .map(|run| scenario_label(run.result.scenario).len())
-        .max()
-        .unwrap_or_default();
-    writeln!(
-        output,
-        "SFU CPU timeline, common peak scale {}",
-        format_cpu_percent(maximum)
-    )?;
-    writeln!(output, "```text")?;
-    for run in runs {
-        let label = scenario_label(run.result.scenario);
-        let timeline = run
-            .samples
-            .as_ref()
-            .and_then(|sample_set| cpu_timeline(&sample_set.samples, maximum));
+fn render_cpu_overview(
+    output: &mut String,
+    summaries: &[(String, TelemetrySummary)],
+    labels: &[String],
+) -> Result<()> {
+    ensure!(
+        summaries.len() == labels.len(),
+        "CPU chart labels must match telemetry summaries"
+    );
+    let mut chart_labels = Vec::new();
+    let mut omitted_labels = Vec::new();
+    let mut averages = Vec::new();
+    let mut peaks = Vec::new();
+    for ((_label, summary), chart_label) in summaries.iter().zip(labels) {
+        let (Some(average), Some(peak)) = (
+            summary.server_cpu_percent_milli,
+            summary.server_cpu_peak_percent_milli,
+        ) else {
+            omitted_labels.push(chart_label);
+            continue;
+        };
+        chart_labels.push(chart_label.clone());
+        averages.push(rounded_div(average, 1_000));
+        peaks.push(rounded_div(peak, 1_000));
+    }
+    if !omitted_labels.is_empty() {
         writeln!(
             output,
-            "{label:label_width$} {}",
-            timeline.as_deref().unwrap_or("n/a")
+            "CPU chart requires an interval-weighted average and sampled peak. Omitted scenarios: {}.\n",
+            omitted_labels
+                .into_iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
         )?;
     }
-    writeln!(output, "```\n")?;
+    if chart_labels.is_empty() {
+        return Ok(());
+    }
+    render_chart(
+        output,
+        "SFU CPU average and peak",
+        "Bars are whole-window weighted averages. The line is the sampled peak.",
+        &chart_labels,
+        "CPU (%)",
+        100,
+        &[ChartPlot::Bar(&averages), ChartPlot::Line(&peaks)],
+    )
+}
+
+fn render_cpu_timeline(output: &mut String, runs: &[RunData]) -> Result<()> {
+    let Some((_peak, run, samples)) = runs
+        .iter()
+        .filter_map(|run| {
+            let samples = &run.samples.as_ref()?.samples;
+            let peak = samples
+                .iter()
+                .filter_map(|sample| sample.server_cpu_percent_milli)
+                .max()?;
+            Some((peak, run, samples))
+        })
+        .max_by_key(|(peak, _run, _samples)| *peak)
+    else {
+        return Ok(());
+    };
+    let values = cpu_series(samples)
+        .into_iter()
+        .map(|value| rounded_div(value, 1_000))
+        .collect::<Vec<_>>();
+    let title = format!("SFU CPU timeline: {}", scenario_label(run.result.scenario));
+    render_line_chart(
+        output,
+        &title,
+        "Each point is the peak of one contiguous CPU sample bucket from the highest-CPU scenario.",
+        "CPU (%)",
+        100,
+        &values,
+    )?;
+    write!(output, "Chart values by sample bucket (CPU %): ")?;
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            write!(output, ", ")?;
+        }
+        write!(output, "{index}={value}")?;
+    }
+    writeln!(output, "\n")?;
     Ok(())
 }
 
-fn cpu_timeline(samples: &[TelemetrySample], maximum: u64) -> Option<String> {
+fn cpu_series(samples: &[TelemetrySample]) -> Vec<u64> {
     let values = samples
         .iter()
         .filter_map(|sample| sample.server_cpu_percent_milli)
         .collect::<Vec<_>>();
-    let buckets = values.len().min(CPU_TIMELINE_WIDTH);
-    if buckets == 0 {
-        return None;
-    }
-    let mut timeline = String::with_capacity(buckets);
+    let buckets = values.len().min(CPU_TIMELINE_POINTS);
+    let mut output = Vec::with_capacity(buckets);
     for bucket in 0..buckets {
         let start = bucket * values.len() / buckets;
         let end = (bucket + 1) * values.len() / buckets;
-        let peak = values
-            .iter()
-            .skip(start)
-            .take(end.saturating_sub(start))
-            .copied()
-            .max()
-            .unwrap_or_default();
-        timeline.push(cpu_level(peak, maximum));
+        output.push(
+            values
+                .iter()
+                .skip(start)
+                .take(end.saturating_sub(start))
+                .copied()
+                .max()
+                .unwrap_or_default(),
+        );
     }
-    Some(timeline)
-}
-
-fn cpu_level(value: u64, maximum: u64) -> char {
-    const LEVELS: &[u8] = b".:-=+*#%@";
-    if maximum == 0 {
-        return '.';
-    }
-    let highest = LEVELS.len().saturating_sub(1);
-    let scaled =
-        u128::from(value) * u128::try_from(highest).unwrap_or_default() / u128::from(maximum);
-    let index = usize::try_from(scaled).unwrap_or(highest).min(highest);
-    char::from(LEVELS.get(index).copied().unwrap_or(b'@'))
+    output
 }
 
 fn render_telemetry_issues(output: &mut String, runs: &[RunData]) -> Result<()> {
@@ -830,43 +859,180 @@ fn render_telemetry_issues(output: &mut String, runs: &[RunData]) -> Result<()> 
     Ok(())
 }
 
-fn render_metric(
+fn render_metric_table(
+    output: &mut String,
+    summaries: &[(String, TelemetrySummary)],
+) -> Result<()> {
+    writeln!(
+        output,
+        "CPU and counter metrics cover the whole sample window including setup, warmup and drain.\n"
+    )?;
+    writeln!(
+        output,
+        "| Scenario | SFU CPU avg | SFU CPU peak | Efficiency | Forwarded | Sample egress | Loop heartbeat delay | SFU RSS | RTC CPU avg | RTC RSS |"
+    )?;
+    writeln!(
+        output,
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+    )?;
+    for (label, summary) in summaries {
+        writeln!(
+            output,
+            "| {label} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            format_optional(summary.server_cpu_percent_milli, format_cpu_percent),
+            format_optional(summary.server_cpu_peak_percent_milli, format_cpu_percent),
+            format_optional(
+                summary.deliveries_per_server_cpu_second,
+                format_delivery_efficiency
+            ),
+            format_optional(
+                summary.forwarded_packets_per_second,
+                format_packets_per_second
+            ),
+            format_optional(
+                summary.egress_payload_bits_per_second,
+                format_bits_per_second
+            ),
+            format_optional(summary.packet_loop_delay_ms, format_milliseconds),
+            format_optional(summary.server_rss_bytes, format_mebibytes),
+            format_optional(summary.rtc_cpu_percent_milli, format_cpu_percent),
+            format_optional(summary.rtc_rss_bytes, format_mebibytes)
+        )?;
+    }
+    writeln!(output)?;
+    Ok(())
+}
+
+fn render_chart(
     output: &mut String,
     title: &str,
-    summaries: &[(String, TelemetrySummary)],
-    value: fn(&TelemetrySummary) -> Option<u64>,
-    format: fn(u64) -> String,
+    description: &str,
+    labels: &[String],
+    y_axis: &str,
+    minimum: u64,
+    plots: &[ChartPlot<'_>],
 ) -> Result<()> {
-    let maximum = summaries
-        .iter()
-        .filter_map(|(_label, summary)| value(summary))
-        .max()
-        .unwrap_or_default();
-    let label_width = summaries
-        .iter()
-        .map(|(label, _summary)| label.len())
-        .max()
-        .unwrap_or_default();
-    writeln!(output, "{title}")?;
-    writeln!(output, "```text")?;
-    for (label, summary) in summaries {
-        if let Some(metric) = value(summary) {
-            writeln!(
-                output,
-                "{label:label_width$} [{}] {}",
-                bar(metric, maximum, '#'),
-                format(metric)
-            )?;
-        } else {
-            writeln!(
-                output,
-                "{label:label_width$} [{}] n/a",
-                ".".repeat(BAR_WIDTH)
-            )?;
+    ensure!(!labels.is_empty(), "chart labels cannot be empty");
+    ensure!(!plots.is_empty(), "chart plots cannot be empty");
+    ensure!(
+        plots.iter().all(|plot| plot.values().len() == labels.len()),
+        "chart plot lengths must match chart labels"
+    );
+    if labels.len() > MAX_CHART_SCENARIOS {
+        writeln!(
+            output,
+            "The {title} chart is omitted because it contains more than {MAX_CHART_SCENARIOS} scenarios. The tabular metrics remain available.\n"
+        )?;
+        return Ok(());
+    }
+    if plots.iter().any(|plot| {
+        plot.values()
+            .iter()
+            .any(|value| *value > MAX_MERMAID_INTEGER)
+    }) {
+        writeln!(
+            output,
+            "The {title} chart is omitted because a value exceeds Mermaid's exact-integer range. The tabular metrics remain available.\n"
+        )?;
+        return Ok(());
+    }
+    let maximum = chart_axis_max(plots.iter().flat_map(ChartPlot::values), minimum);
+    writeln!(output, "{description}\n")?;
+    writeln!(output, "```mermaid")?;
+    writeln!(output, "xychart-beta")?;
+    writeln!(output, "    accTitle: {title}")?;
+    writeln!(output, "    accDescr: {description}")?;
+    writeln!(output, "    title \"{title}\"")?;
+    write!(output, "    x-axis [")?;
+    for (index, label) in labels.iter().enumerate() {
+        if index > 0 {
+            write!(output, ", ")?;
         }
+        write!(output, "\"{label}\"")?;
+    }
+    writeln!(output, "]")?;
+    writeln!(output, "    y-axis \"{y_axis}\" 0 --> {maximum}")?;
+    for plot in plots {
+        write!(output, "    {} [", plot.keyword())?;
+        write_values(output, plot.values())?;
+        writeln!(output, "]")?;
     }
     writeln!(output, "```\n")?;
     Ok(())
+}
+
+fn render_line_chart(
+    output: &mut String,
+    title: &str,
+    description: &str,
+    y_axis: &str,
+    y_minimum: u64,
+    values: &[u64],
+) -> Result<()> {
+    ensure!(!values.is_empty(), "line chart values cannot be empty");
+    ensure!(
+        values.len() <= CPU_TIMELINE_POINTS,
+        "line chart exceeds the CPU timeline point limit"
+    );
+    if values.iter().any(|value| *value > MAX_MERMAID_INTEGER) {
+        writeln!(
+            output,
+            "The {title} chart is omitted because a value exceeds Mermaid's exact-integer range. Numeric values remain below.\n"
+        )?;
+        return Ok(());
+    }
+    let last_bucket = u64::try_from(values.len().saturating_sub(1))
+        .unwrap_or(1)
+        .max(1);
+    let maximum = chart_axis_max(values.iter(), y_minimum);
+    writeln!(output, "{description}\n")?;
+    writeln!(output, "```mermaid")?;
+    writeln!(output, "xychart-beta")?;
+    writeln!(output, "    accTitle: {title}")?;
+    writeln!(output, "    accDescr: {description}")?;
+    writeln!(output, "    title \"{title}\"")?;
+    writeln!(output, "    x-axis \"sample bucket\" 0 --> {last_bucket}")?;
+    writeln!(output, "    y-axis \"{y_axis}\" 0 --> {maximum}")?;
+    write!(output, "    line [")?;
+    write_values(output, values)?;
+    writeln!(output, "]")?;
+    writeln!(output, "```\n")?;
+    Ok(())
+}
+
+fn write_values(output: &mut String, values: &[u64]) -> Result<()> {
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            write!(output, ", ")?;
+        }
+        write!(output, "{value}")?;
+    }
+    Ok(())
+}
+
+fn chart_axis_max<'a>(values: impl Iterator<Item = &'a u64>, minimum: u64) -> u64 {
+    let maximum = values.copied().max().unwrap_or_default();
+    if maximum == 0 {
+        return minimum.max(1);
+    }
+    if maximum <= minimum {
+        return minimum;
+    }
+    let padded = (u128::from(maximum) * 11).div_ceil(10);
+    let padded = u64::try_from(padded)
+        .unwrap_or(MAX_MERMAID_INTEGER)
+        .min(MAX_MERMAID_INTEGER);
+    let step = 10_u64.pow(padded.ilog10().saturating_sub(1));
+    padded
+        .div_ceil(step)
+        .saturating_mul(step)
+        .min(MAX_MERMAID_INTEGER)
+        .max(maximum)
+        .max(minimum)
+}
+
+fn format_optional(value: Option<u64>, format: fn(u64) -> String) -> String {
+    value.map_or_else(|| "n/a".to_owned(), format)
 }
 
 fn run_passed(run: &RunData) -> bool {
@@ -966,6 +1132,25 @@ fn scenario_label(spec: ScenarioSpec) -> String {
     }
 }
 
+fn chart_label(spec: ScenarioSpec) -> String {
+    match spec {
+        ScenarioSpec::Smoke { receivers, packets } => {
+            format!("smoke {receivers}r {packets}p")
+        }
+        ScenarioSpec::AudioMesh {
+            rooms,
+            peers,
+            seconds,
+        } => format!("audio {rooms}x{peers} {seconds}s"),
+        ScenarioSpec::VideoGallery {
+            rooms,
+            peers,
+            publishers,
+            seconds,
+        } => format!("video {rooms}x{peers} {publishers}p {seconds}s"),
+    }
+}
+
 fn revision_label(runs: &[RunData]) -> String {
     let revisions = runs
         .iter()
@@ -983,20 +1168,33 @@ fn revision_label(runs: &[RunData]) -> String {
     }
 }
 
-fn bar(value: u64, maximum: u64, fill: char) -> String {
-    let cells = if value == 0 || maximum == 0 {
-        0
-    } else {
-        let scaled =
-            (u128::from(value) * BAR_WIDTH_U128 + u128::from(maximum) / 2) / u128::from(maximum);
-        usize::try_from(scaled)
-            .unwrap_or(BAR_WIDTH)
-            .clamp(1, BAR_WIDTH)
+fn scheduled_payload_bits_per_second(result: &ScenarioResult) -> u64 {
+    let duration_ms = match result.scenario {
+        ScenarioSpec::Smoke { packets, .. } => {
+            u64::from(packets) * 1_000 / u64::from(AUDIO_PACKETS_PER_SECOND)
+        }
+        ScenarioSpec::AudioMesh { seconds, .. } | ScenarioSpec::VideoGallery { seconds, .. } => {
+            u64::from(seconds) * 1_000
+        }
     };
-    let mut output = String::with_capacity(BAR_WIDTH);
-    output.extend(repeat_n(fill, cells));
-    output.extend(repeat_n('.', BAR_WIDTH - cells));
-    output
+    payload_bits_per_second(result.plan.offered_payload_bytes, duration_ms)
+}
+
+fn delivered_payload_bits_per_second(result: &ScenarioResult) -> u64 {
+    payload_bits_per_second(result.delivered_payload_bytes, result.elapsed_ms)
+}
+
+fn payload_bits_per_second(bytes: u64, elapsed_ms: u64) -> u64 {
+    if elapsed_ms == 0 {
+        return 0;
+    }
+    let rate = u128::from(bytes) * 8_000 / u128::from(elapsed_ms);
+    u64::try_from(rate).unwrap_or(u64::MAX)
+}
+
+fn rounded_div(value: u64, divisor: u64) -> u64 {
+    let rounded = (u128::from(value) + u128::from(divisor) / 2) / u128::from(divisor);
+    u64::try_from(rounded).unwrap_or(u64::MAX)
 }
 
 fn grouped(value: u64) -> String {
