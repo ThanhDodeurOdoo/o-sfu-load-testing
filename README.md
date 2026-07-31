@@ -101,16 +101,20 @@ metrics. Raw JSONL and logs remain available as workflow artifacts.
 CI runs the bounded smoke. The nightly workflow runs these fixed profiles
 using four assigned logical CPUs:
 
-| Profile | Exact expected deliveries |
-| --- | ---: |
-| 1 room × 8 audio peers × 30 s | 84,000 |
-| 2 rooms × 12 audio peers × 60 s | 792,000 |
-| 3 rooms × 12 audio peers × 120 s | 2,376,000 |
-| 1 room × 12 peers × 4 cameras × 30 s | 181,560 |
+| Profile | Publishers/room | Consumers/source | Deliveries/s | Exact deliveries |
+| --- | ---: | ---: | ---: | ---: |
+| 1 room × 8 audio peers × 30 s | 8 | 7 | 2,800 | 84,000 |
+| 2 rooms × 12 audio peers × 60 s | 12 | 11 | 13,200 | 792,000 |
+| 3 rooms × 12 audio peers × 120 s | 12 | 11 | 19,800 | 2,376,000 |
+| 1 room × 28 audio peers × 120 s | 28 | 27 | 37,800 | 4,536,000 |
+| 1 room × 12 peers × 4 cameras × 30 s | 4 | 11 | 6,052 | 181,560 |
+| 1 room × 64 peers × 10 cameras × 60 s | 10 | 63 | 44,335 | 2,660,100 |
 
-The nightly run therefore requires 3,433,560 exact forwarded deliveries. Its
-job summary renders the graphs directly without requiring an artifact download.
-Artifacts retain the detailed evidence.
+The 28-peer audio room exercises 756 simultaneous source-to-receiver routes.
+The 64-peer video room exercises 10 simulcast publishers and 630 selected
+source-to-receiver routes. The nightly run requires 10,629,660 exact forwarded
+deliveries. Its job summary renders the graphs directly without requiring an
+artifact download. Artifacts retain the detailed evidence.
 
 Shared GitHub runners make CPU, RSS and rate measurements trend data. Exact
 packet delivery and clean process shutdown are deterministic gates. The nightly
