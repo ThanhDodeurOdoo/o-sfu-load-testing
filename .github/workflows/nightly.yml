@@ -4,6 +4,15 @@ on:
   schedule:
     - cron: "17 2 * * *"
   workflow_dispatch:
+    inputs:
+      comparison_revision:
+        description: Full o-sfu commit SHA to compare
+        required: false
+        type: string
+      baseline_revision:
+        description: Full baseline SHA or empty for current master
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -28,11 +37,127 @@ jobs:
           rustup toolchain install 1.95.0 --profile minimal --component clippy
           rustup toolchain install nightly-2026-04-20 --profile minimal --component rustfmt
 
-      - name: Resolve current o-sfu master
-        run: cargo update -p o-sfu
+      - name: Resolve o-sfu revisions
+        id: revisions
+        env:
+          BASELINE_INPUT: ${{ inputs.baseline_revision }}
+          COMPARISON_INPUT: ${{ inputs.comparison_revision }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          normalize_sha() {
+            local label=$1
+            local revision=$2
+            if [[ ! "$revision" =~ ^[0-9a-fA-F]{40}$ ]]; then
+              echo "$label must be one full 40-character commit SHA" >&2
+              exit 1
+            fi
+            printf '%s' "$revision" | tr 'A-F' 'a-f'
+          }
+
+          resolve_commit() {
+            local label=$1
+            local revision=$2
+            local resolved
+            revision=$(normalize_sha "$label" "$revision")
+            resolved=$(gh api \
+              "repos/ThanhDodeurOdoo/o-sfu/git/commits/$revision" \
+              --jq .sha)
+            if [[ "$resolved" != "$revision" ]]; then
+              echo "$label did not resolve to the requested o-sfu commit" >&2
+              exit 1
+            fi
+            printf '%s' "$resolved"
+          }
+
+          if [[ -n "$BASELINE_INPUT" && -z "$COMPARISON_INPUT" ]]; then
+            echo "baseline_revision requires comparison_revision" >&2
+            exit 1
+          fi
+
+          master=$(gh api \
+            repos/ThanhDodeurOdoo/o-sfu/git/ref/heads/master \
+            --jq .object.sha)
+          master=$(resolve_commit "o-sfu master" "$master")
+
+          if [[ -z "$COMPARISON_INPUT" ]]; then
+            mode=single
+            baseline=$master
+            comparison=
+            artifact_name=nightly-load-results
+          else
+            mode=comparison
+            comparison=$(resolve_commit \
+              "comparison_revision" "$COMPARISON_INPUT")
+            if [[ -n "$BASELINE_INPUT" ]]; then
+              baseline=$(resolve_commit \
+                "baseline_revision" "$BASELINE_INPUT")
+            else
+              baseline=$master
+            fi
+            if [[ "$baseline" == "$comparison" ]]; then
+              echo "baseline and comparison revisions must differ" >&2
+              exit 1
+            fi
+            artifact_name=nightly-load-comparison-results
+          fi
+
+          {
+            echo "mode=$mode"
+            echo "baseline_revision=$baseline"
+            echo "comparison_revision=$comparison"
+            echo "artifact_name=$artifact_name"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Build isolated processes
-        run: cargo build --locked --release --bins
+        env:
+          BASELINE_REVISION: ${{ steps.revisions.outputs.baseline_revision }}
+          COMPARISON_REVISION: ${{ steps.revisions.outputs.comparison_revision }}
+          MODE: ${{ steps.revisions.outputs.mode }}
+        run: |
+          set -euo pipefail
+
+          verify_lock() {
+            local expected=$1
+            local revisions
+            revisions=$(awk '
+              index($0, "source = \"git+https://github.com/ThanhDodeurOdoo/o-sfu") == 1 {
+                split($0, parts, "#")
+                revision = parts[length(parts)]
+                sub(/\"$/, "", revision)
+                print revision
+              }
+            ' Cargo.lock | sort -u)
+            if [[ "$revisions" != "$expected" ]]; then
+              echo "Cargo.lock resolved unexpected o-sfu revisions:" >&2
+              echo "$revisions" >&2
+              exit 1
+            fi
+          }
+
+          build_variant() {
+            local revision=$1
+            local target_directory=$2
+            local lock_path=$3
+            cargo update -p o-sfu --precise "$revision"
+            verify_lock "$revision"
+            mkdir -p "$(dirname "$lock_path")"
+            cp Cargo.lock "$lock_path"
+            CARGO_TARGET_DIR="$target_directory" \
+              cargo build --locked --release --bins
+          }
+
+          if [[ "$MODE" == single ]]; then
+            cargo update -p o-sfu --precise "$BASELINE_REVISION"
+            verify_lock "$BASELINE_REVISION"
+            cargo build --locked --release --bins
+          else
+            build_variant "$BASELINE_REVISION" \
+              target/baseline artifacts/baseline/Cargo.lock
+            build_variant "$COMPARISON_REVISION" \
+              target/comparison artifacts/comparison/Cargo.lock
+          fi
 
       - name: Check runner isolation
         run: |
@@ -45,29 +170,58 @@ jobs:
           taskset --cpu-list 1-3 true
 
       - name: Run deterministic load profiles
+        env:
+          MODE: ${{ steps.revisions.outputs.mode }}
         run: |
           status=0
+
           run_load() {
-            target/release/o-sfu-load \
-              --server-binary target/release/o-sfu-load-server \
-              --rtc-binary target/release/o-sfu-load-rtc \
+            local target_directory=$1
+            local output=$2
+            shift 2
+            "$target_directory/release/o-sfu-load" \
+              --server-binary "$target_directory/release/o-sfu-load-server" \
+              --rtc-binary "$target_directory/release/o-sfu-load-rtc" \
               --server-cpus 0 \
               --rtc-cpus 1-3 \
+              --output "$output" \
               "$@" || status=1
           }
 
-          run_load --output artifacts/audio-1x8 audio-mesh \
-            --rooms 1 --peers 8 --seconds 30
-          run_load --output artifacts/audio-2x12 audio-mesh \
-            --rooms 2 --peers 12 --seconds 60
-          run_load --output artifacts/audio-3x12 audio-mesh \
-            --rooms 3 --peers 12 --seconds 120
-          run_load --output artifacts/audio-1x28 audio-mesh \
-            --rooms 1 --peers 28 --seconds 120
-          run_load --output artifacts/video-1x12 video-gallery \
-            --rooms 1 --peers 12 --publishers 4 --seconds 30
-          run_load --output artifacts/video-1x64 video-gallery \
-            --rooms 1 --peers 64 --publishers 10 --seconds 60
+          run_profiles() {
+            local run_profile=$1
+            "$run_profile" audio-1x8 \
+              audio-mesh --rooms 1 --peers 8 --seconds 30
+            "$run_profile" audio-2x12 \
+              audio-mesh --rooms 2 --peers 12 --seconds 60
+            "$run_profile" audio-3x12 \
+              audio-mesh --rooms 3 --peers 12 --seconds 120
+            "$run_profile" audio-1x28 \
+              audio-mesh --rooms 1 --peers 28 --seconds 120
+            "$run_profile" video-1x12 \
+              video-gallery --rooms 1 --peers 12 --publishers 4 --seconds 30
+            "$run_profile" video-1x64 \
+              video-gallery --rooms 1 --peers 64 --publishers 10 --seconds 60
+          }
+
+          run_single_profile() {
+            local name=$1
+            shift
+            run_load target "artifacts/$name" "$@"
+          }
+
+          run_comparison_profile() {
+            local name=$1
+            shift
+            run_load target/baseline "artifacts/baseline/$name" "$@"
+            run_load target/comparison "artifacts/comparison/$name" "$@"
+          }
+
+          if [[ "$MODE" == single ]]; then
+            run_profiles run_single_profile
+          else
+            run_profiles run_comparison_profile
+          fi
 
           exit "$status"
 
@@ -76,7 +230,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: nightly-load-results
+          name: ${{ steps.revisions.outputs.artifact_name }}
           path: |
             artifacts
             Cargo.lock
@@ -87,23 +241,52 @@ jobs:
         if: always()
         env:
           ARTIFACT_URL: ${{ steps.load-artifact.outputs.artifact-url }}
+          MODE: ${{ steps.revisions.outputs.mode }}
         run: |
           mkdir -p artifacts
           summary=artifacts/summary.md
-          if [[ -x target/release/o-sfu-load-report ]]; then
-            args=(
-              --input artifacts/audio-1x8
-              --input artifacts/audio-2x12
-              --input artifacts/audio-3x12
-              --input artifacts/audio-1x28
-              --input artifacts/video-1x12
-              --input artifacts/video-1x64
-              --output "$summary"
-            )
+          if [[ "$MODE" == comparison ]]; then
+            reporter=target/baseline/release/o-sfu-load-report
+          else
+            reporter=target/release/o-sfu-load-report
+          fi
+
+          if [[ -x "$reporter" ]]; then
+            if [[ "$MODE" == comparison ]]; then
+              args=(
+                --baseline-input artifacts/baseline/audio-1x8
+                --baseline-input artifacts/baseline/audio-2x12
+                --baseline-input artifacts/baseline/audio-3x12
+                --baseline-input artifacts/baseline/audio-1x28
+                --baseline-input artifacts/baseline/video-1x12
+                --baseline-input artifacts/baseline/video-1x64
+                --comparison-input artifacts/comparison/audio-1x8
+                --comparison-input artifacts/comparison/audio-2x12
+                --comparison-input artifacts/comparison/audio-3x12
+                --comparison-input artifacts/comparison/audio-1x28
+                --comparison-input artifacts/comparison/video-1x12
+                --comparison-input artifacts/comparison/video-1x64
+                --output "$summary"
+              )
+            else
+              args=(
+                --input artifacts/audio-1x8
+                --input artifacts/audio-2x12
+                --input artifacts/audio-3x12
+                --input artifacts/audio-1x28
+                --input artifacts/video-1x12
+                --input artifacts/video-1x64
+                --output "$summary"
+              )
+            fi
             if [[ -n "$ARTIFACT_URL" ]]; then
               args+=(--artifact-url "$ARTIFACT_URL")
             fi
-            target/release/o-sfu-load-report "${args[@]}"
+            "$reporter" "${args[@]}"
+          elif [[ "$MODE" == comparison ]]; then
+            echo '# o-sfu revision comparison' > "$summary"
+            echo >> "$summary"
+            echo 'No comparison result was available.' >> "$summary"
           else
             echo '# o-sfu load report' > "$summary"
             echo >> "$summary"

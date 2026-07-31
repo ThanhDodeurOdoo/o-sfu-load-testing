@@ -15,26 +15,26 @@ const CPU_TIMELINE_POINTS: usize = 32;
 const GITHUB_SUMMARY_LIMIT_BYTES: usize = 1024 * 1024;
 const RESULT_LIMIT_BYTES: u64 = 1024 * 1024;
 const SAMPLES_LIMIT_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_INPUTS: usize = 256;
+pub(crate) const MAX_INPUTS: usize = 256;
 const MAX_CHART_SCENARIOS: usize = 12;
 const MAX_TELEMETRY_SAMPLES: usize = 10_000;
 const MAX_TELEMETRY_ERRORS: usize = 8;
 const MAX_MERMAID_INTEGER: u64 = 9_007_199_254_740_991;
 
 #[derive(Clone)]
-struct RunData {
-    source: String,
-    result: ScenarioResult,
-    samples: Option<SampleSet>,
+pub(crate) struct RunData {
+    pub(crate) source: String,
+    pub(crate) result: ScenarioResult,
+    pub(crate) samples: Option<SampleSet>,
 }
 
-struct LoadFailure {
-    source: String,
-    error: String,
+pub(crate) struct LoadFailure {
+    pub(crate) source: String,
+    pub(crate) error: String,
 }
 
 #[derive(Clone)]
-struct SampleSet {
+pub(crate) struct SampleSet {
     samples: Vec<TelemetrySample>,
     unavailable: usize,
     errors: Vec<String>,
@@ -56,24 +56,25 @@ struct TelemetrySample {
     packet_loop_delay_ms: Option<u64>,
 }
 
-struct TelemetrySummary {
-    samples: usize,
-    unavailable: usize,
-    elapsed_ms: Option<u64>,
-    server_ticks_observed: bool,
-    rtc_ticks_observed: bool,
-    server_cpu_percent_milli: Option<u64>,
-    server_cpu_peak_percent_milli: Option<u64>,
-    server_rss_bytes: Option<u64>,
-    rtc_cpu_percent_milli: Option<u64>,
-    rtc_rss_bytes: Option<u64>,
-    deliveries_per_server_cpu_second: Option<u64>,
-    forwarded_packets_per_second: Option<u64>,
-    egress_payload_bits_per_second: Option<u64>,
-    packet_loop_delay_ms: Option<u64>,
+pub(crate) struct TelemetrySummary {
+    pub(crate) samples: usize,
+    pub(crate) unavailable: usize,
+    pub(crate) elapsed_ms: Option<u64>,
+    pub(crate) server_ticks_observed: bool,
+    pub(crate) rtc_ticks_observed: bool,
+    pub(crate) server_cpu_percent_milli: Option<u64>,
+    pub(crate) server_cpu_peak_percent_milli: Option<u64>,
+    pub(crate) server_rss_bytes: Option<u64>,
+    pub(crate) rtc_cpu_percent_milli: Option<u64>,
+    pub(crate) rtc_rss_bytes: Option<u64>,
+    pub(crate) deliveries_per_server_cpu_second: Option<u64>,
+    pub(crate) server_cpu_micros_per_million_deliveries: Option<u64>,
+    pub(crate) forwarded_packets_per_second: Option<u64>,
+    pub(crate) egress_payload_bits_per_second: Option<u64>,
+    pub(crate) packet_loop_delay_ms: Option<u64>,
 }
 
-enum ChartPlot<'a> {
+pub(crate) enum ChartPlot<'a> {
     Bar(&'a [u64]),
     Line(&'a [u64]),
 }
@@ -139,7 +140,7 @@ pub fn write(inputs: &[PathBuf], output: &Path, artifact_url: Option<&str>) -> R
     fs::write(output, summary).context("failed to write the report")
 }
 
-fn load_run(input: &Path) -> Result<RunData> {
+pub(crate) fn load_run(input: &Path) -> Result<RunData> {
     let result_path = if input.is_dir() {
         input.join("result.json")
     } else {
@@ -203,7 +204,7 @@ fn read_optional_bounded(path: &Path, limit: u64) -> Result<Option<String>> {
         .with_context(|| format!("{} is not UTF-8", path.display()))
 }
 
-fn parse_samples(payload: &str) -> SampleSet {
+pub(crate) fn parse_samples(payload: &str) -> SampleSet {
     let mut samples = Vec::new();
     let mut unavailable = 0_usize;
     let mut errors = Vec::new();
@@ -304,7 +305,7 @@ impl TelemetrySample {
 }
 
 impl TelemetrySummary {
-    fn from_samples(sample_set: Option<&SampleSet>, delivered_packets: u64) -> Self {
+    pub(crate) fn from_samples(sample_set: Option<&SampleSet>, delivered_packets: u64) -> Self {
         let Some(sample_set) = sample_set else {
             return Self {
                 samples: 0,
@@ -318,6 +319,7 @@ impl TelemetrySummary {
                 rtc_cpu_percent_milli: None,
                 rtc_rss_bytes: None,
                 deliveries_per_server_cpu_second: None,
+                server_cpu_micros_per_million_deliveries: None,
                 forwarded_packets_per_second: None,
                 egress_payload_bits_per_second: None,
                 packet_loop_delay_ms: None,
@@ -354,6 +356,11 @@ impl TelemetrySummary {
                     / u128::from(ticks);
                 u64::try_from(deliveries).unwrap_or(u64::MAX)
             }),
+            server_cpu_micros_per_million_deliveries: server_cpu_ticks.and_then(
+                |(ticks, ticks_per_second)| {
+                    cpu_micros_per_million(ticks, ticks_per_second, delivered_packets)
+                },
+            ),
             forwarded_packets_per_second: counter_rate(
                 samples,
                 |sample| sample.forwarded_packets,
@@ -418,6 +425,19 @@ fn server_cpu_ticks(samples: &[TelemetrySample]) -> Option<(u64, u64)> {
     (delta > 0 && last.1 > 0).then_some((delta, last.1))
 }
 
+fn cpu_micros_per_million(
+    ticks: u64,
+    ticks_per_second: u64,
+    delivered_packets: u64,
+) -> Option<u64> {
+    if ticks_per_second == 0 || delivered_packets == 0 {
+        return None;
+    }
+    let numerator = u128::from(ticks) * 1_000_000_000_000;
+    let denominator = u128::from(ticks_per_second) * u128::from(delivered_packets);
+    u64::try_from(numerator / denominator).ok()
+}
+
 fn counter_rate(
     samples: &[TelemetrySample],
     value: fn(&TelemetrySample) -> Option<u64>,
@@ -472,6 +492,7 @@ fn render_report(
         writeln!(output, "No valid result files were available.\n")?;
     } else {
         render_workloads(&mut output, &runs)?;
+        render_scenario_legend(&mut output)?;
         render_delivery(&mut output, &runs)?;
         render_discrepancies(&mut output, &runs)?;
         if runs.iter().any(|run| run.samples.is_some()) {
@@ -564,6 +585,27 @@ fn render_workloads(output: &mut String, runs: &[RunData]) -> Result<()> {
         )?;
     }
     writeln!(output)?;
+    Ok(())
+}
+
+pub(crate) fn render_scenario_legend(output: &mut String) -> Result<()> {
+    writeln!(output, "## Scenario label legend\n")?;
+    writeln!(
+        output,
+        "Tables use hyphenated IDs. Graphs use the shorter space-separated form.\n"
+    )?;
+    writeln!(
+        output,
+        "- `smoke-2r-50p` or `smoke 2r 50p` means 2 receivers get 50 packets from one publisher."
+    )?;
+    writeln!(
+        output,
+        "- `audio-mesh-2x12-60s` or `audio 2x12 60s` means 2 rooms with 12 peers per room. Every peer publishes audio for 60 seconds."
+    )?;
+    writeln!(
+        output,
+        "- `video-gallery-1x64-10p-60s` or `video 1x64 10p 60s` means 1 room with 64 peers. 10 peers per room publish video for 60 seconds.\n"
+    )?;
     Ok(())
 }
 
@@ -903,7 +945,7 @@ fn render_metric_table(
     Ok(())
 }
 
-fn render_chart(
+pub(crate) fn render_chart(
     output: &mut String,
     title: &str,
     description: &str,
@@ -1039,7 +1081,7 @@ fn run_passed(run: &RunData) -> bool {
     validate_run(run).is_ok()
 }
 
-fn validate_run(run: &RunData) -> Result<()> {
+pub(crate) fn validate_run(run: &RunData) -> Result<()> {
     run.result.validate(run.result.scenario)
 }
 
@@ -1083,7 +1125,7 @@ fn pacing_label(result: &ScenarioResult) -> &'static str {
     }
 }
 
-fn pacing_valid(result: &ScenarioResult) -> bool {
+pub(crate) fn pacing_valid(result: &ScenarioResult) -> bool {
     let interval_ms = match result.scenario {
         ScenarioSpec::Smoke { .. } | ScenarioSpec::AudioMesh { .. } => 20,
         ScenarioSpec::VideoGallery { .. } => 34,
@@ -1091,11 +1133,11 @@ fn pacing_valid(result: &ScenarioResult) -> bool {
     result.max_send_lag_ms <= interval_ms
 }
 
-fn delivery_rate(result: &ScenarioResult) -> u64 {
+pub(crate) fn delivery_rate(result: &ScenarioResult) -> u64 {
     result.achieved_deliveries_per_second()
 }
 
-fn scenario_key(spec: ScenarioSpec) -> (u8, u32, u32, u32, u32, u64) {
+pub(crate) fn scenario_key(spec: ScenarioSpec) -> (u8, u32, u32, u32, u32, u64) {
     let rank = match spec {
         ScenarioSpec::Smoke { .. } => 0,
         ScenarioSpec::AudioMesh { .. } => 1,
@@ -1113,7 +1155,7 @@ fn scenario_key(spec: ScenarioSpec) -> (u8, u32, u32, u32, u32, u64) {
     )
 }
 
-fn scenario_label(spec: ScenarioSpec) -> String {
+pub(crate) fn scenario_label(spec: ScenarioSpec) -> String {
     match spec {
         ScenarioSpec::Smoke { receivers, packets } => {
             format!("smoke-{receivers}r-{packets}p")
@@ -1132,7 +1174,7 @@ fn scenario_label(spec: ScenarioSpec) -> String {
     }
 }
 
-fn chart_label(spec: ScenarioSpec) -> String {
+pub(crate) fn chart_label(spec: ScenarioSpec) -> String {
     match spec {
         ScenarioSpec::Smoke { receivers, packets } => {
             format!("smoke {receivers}r {packets}p")
@@ -1180,7 +1222,7 @@ fn scheduled_payload_bits_per_second(result: &ScenarioResult) -> u64 {
     payload_bits_per_second(result.plan.offered_payload_bytes, duration_ms)
 }
 
-fn delivered_payload_bits_per_second(result: &ScenarioResult) -> u64 {
+pub(crate) fn delivered_payload_bits_per_second(result: &ScenarioResult) -> u64 {
     payload_bits_per_second(result.delivered_payload_bytes, result.elapsed_ms)
 }
 
@@ -1209,17 +1251,17 @@ fn grouped(value: u64) -> String {
     output
 }
 
-fn format_cpu_percent(value: u64) -> String {
+pub(crate) fn format_cpu_percent(value: u64) -> String {
     format!("{}.{:03}%", value / 1_000, value % 1_000)
 }
 
-fn format_mebibytes(value: u64) -> String {
+pub(crate) fn format_mebibytes(value: u64) -> String {
     const MEBIBYTE: u128 = 1024 * 1024;
     let tenths = u128::from(value) * 10 / MEBIBYTE;
     format!("{}.{:01} MiB", tenths / 10, tenths % 10)
 }
 
-fn format_milliseconds(value: u64) -> String {
+pub(crate) fn format_milliseconds(value: u64) -> String {
     format!("{} ms", grouped(value))
 }
 
@@ -1231,7 +1273,7 @@ fn format_packets_per_second(value: u64) -> String {
     format!("{} packets/s", grouped(value))
 }
 
-fn format_bits_per_second(value: u64) -> String {
+pub(crate) fn format_bits_per_second(value: u64) -> String {
     if value >= 1_000_000_000 {
         return format_decimal_rate(value, 1_000_000_000, "Gbit/s");
     }
@@ -1253,7 +1295,7 @@ const fn observed(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
 }
 
-fn escape_table(value: &str) -> String {
+pub(crate) fn escape_table(value: &str) -> String {
     let mut output = String::with_capacity(value.len());
     for character in value.chars() {
         match character {
@@ -1278,7 +1320,7 @@ fn escape_table(value: &str) -> String {
     output
 }
 
-fn validate_artifact_url(artifact_url: Option<&str>) -> Result<()> {
+pub(crate) fn validate_artifact_url(artifact_url: Option<&str>) -> Result<()> {
     if let Some(url) = artifact_url {
         let parts = url
             .strip_prefix("https://github.com/")
@@ -1320,7 +1362,7 @@ fn numeric_identifier(value: &str) -> bool {
     !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
-fn ensure_summary_size(summary: &str) -> Result<()> {
+pub(crate) fn ensure_summary_size(summary: &str) -> Result<()> {
     ensure!(
         summary.len() <= GITHUB_SUMMARY_LIMIT_BYTES,
         "report exceeds GitHub's one MiB job-summary limit"

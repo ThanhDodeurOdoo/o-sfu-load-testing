@@ -2,8 +2,8 @@ use serde_json::json;
 
 use super::{
     GITHUB_SUMMARY_LIMIT_BYTES, LoadFailure, RunData, SampleSet, TelemetrySummary, chart_axis_max,
-    delivery_rate, ensure_summary_size, escape_table, format_mebibytes, parse_samples,
-    render_report, validate_artifact_url,
+    cpu_micros_per_million, delivery_rate, ensure_summary_size, escape_table, format_mebibytes,
+    parse_samples, render_report, validate_artifact_url,
 };
 use crate::{ScenarioResult, ScenarioSpec};
 
@@ -30,6 +30,8 @@ fn report_sorts_workloads_and_renders_visual_rates() -> anyhow::Result<()> {
     assert!(report.contains("line [64, 5760]"));
     assert!(report.contains("accTitle: Observed receiver deliveries per second"));
     assert!(report.contains("accDescr: Bars compare receiver-observed delivery rates"));
+    assert!(report.contains("## Scenario label legend"));
+    assert!(report.contains("`video-gallery-1x64-10p-60s` or `video 1x64 10p 60s`"));
     assert!(report.contains("| audio-mesh-1x10-1s | 4,500 | 4,500 | 4,500/s |"));
     Ok(())
 }
@@ -232,6 +234,12 @@ fn telemetry_cpu_average_is_weighted_by_sample_interval() {
 
     assert_eq!(summary.server_cpu_percent_milli, Some(17_500));
     assert_eq!(summary.rtc_cpu_percent_milli, Some(8_000));
+}
+
+#[test]
+fn cpu_time_per_million_uses_unrounded_process_ticks() {
+    assert_eq!(cpu_micros_per_million(25, 100, 50), Some(5_000_000_000));
+    assert_eq!(cpu_micros_per_million(25, 100, 0), None);
 }
 
 #[test]

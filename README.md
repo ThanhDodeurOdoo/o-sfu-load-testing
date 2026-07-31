@@ -96,6 +96,22 @@ and timeline data.
 Tables retain the authoritative counters, packet discrepancies and process
 metrics. Raw JSONL and logs remain available as workflow artifacts.
 
+The comparison mode pairs the same scenario from two revisions:
+
+```bash
+target/release/o-sfu-load-report \
+  --baseline-input artifacts/baseline/audio \
+  --comparison-input artifacts/comparison/audio \
+  --output artifacts/summary.md
+```
+
+It requires identical scenario, profile, server policy and workload plans.
+Each Mermaid graph uses baseline bars plus comparison lines on one scenario
+axis. Tables show comparison-minus-baseline deltas beside exact delivery
+evidence. The report includes a label legend. For example
+`video-gallery-1x64-10p-60s` means one room with 64 peers, 10 video publishers
+per room and a 60 second workload.
+
 ## GitHub Actions
 
 CI runs the bounded smoke. The nightly workflow runs these fixed profiles
@@ -115,6 +131,27 @@ The 64-peer video room exercises 10 simulcast publishers and 630 selected
 source-to-receiver routes. The nightly run requires 10,629,660 exact forwarded
 deliveries. Its job summary renders the graphs directly without requiring an
 artifact download. Artifacts retain the detailed evidence.
+
+Scheduled runs and manual runs without comparison inputs keep the ordinary
+single-version behavior. A manual comparison accepts `comparison_revision` as
+one full o-sfu commit SHA. `baseline_revision` accepts another full SHA or
+defaults to the o-sfu `master` commit resolved at the start of the job. A
+baseline without a comparison is invalid. Both values are syntax-checked then
+verified against the fixed o-sfu GitHub repository before Cargo receives them.
+
+Both binary sets are built before measurement with separate Cargo locks and
+target directories. The fixed scenario suite then runs sequentially on the
+same `ubuntu-24.04` virtual machine. Both revisions assign the SFU to CPU 0 and
+the RTC generator to CPUs 1 through 3. Each baseline scenario runs immediately
+before its matching comparison scenario. Comparison artifacts retain both
+result trees plus both lock files.
+
+Comparison graphs cover receiver deliveries, receiver-observed RTP payload,
+SFU CPU time per million deliveries, generator send lag, packet-loop delay,
+SFU CPU average and SFU peak RSS. Tables also retain sampled CPU peaks, RTC CPU,
+RTC RSS, SFU forwarding rate and sampled egress payload. CPU time per million
+uses process CPU ticks across the telemetry window. That window includes setup,
+warmup, measured work and drain.
 
 Shared GitHub runners make CPU, RSS and rate measurements trend data. Exact
 packet delivery and clean process shutdown are deterministic gates. The nightly

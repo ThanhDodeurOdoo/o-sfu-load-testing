@@ -1,4 +1,5 @@
 pub mod client;
+pub mod comparison;
 pub mod controller;
 pub mod report;
 pub mod telemetry;
