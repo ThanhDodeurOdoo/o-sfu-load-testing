@@ -50,11 +50,13 @@ jobs:
           exec target/release/o-sfu-load \
             --server-binary target/release/o-sfu-load-server \
             --rtc-binary target/release/o-sfu-load-rtc \
+            --output artifacts/smoke \
+            smoke \
             --receivers 1 \
-            --packets 50 \
-            --output artifacts/smoke
+            --packets 50
 
       - name: Upload smoke artifacts
+        id: smoke-artifact
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
@@ -62,3 +64,23 @@ jobs:
           path: artifacts/smoke
           if-no-files-found: warn
           retention-days: 30
+
+      - name: Publish smoke summary
+        if: always()
+        env:
+          ARTIFACT_URL: ${{ steps.smoke-artifact.outputs.artifact-url }}
+        run: |
+          summary=artifacts/summary.md
+          if [[ -x target/release/o-sfu-load-report ]]; then
+            args=(--input artifacts/smoke --output "$summary")
+            if [[ -n "$ARTIFACT_URL" ]]; then
+              args+=(--artifact-url "$ARTIFACT_URL")
+            fi
+            target/release/o-sfu-load-report "${args[@]}"
+          else
+            mkdir -p artifacts
+            echo '# o-sfu load report' > "$summary"
+            echo >> "$summary"
+            echo 'The RTC smoke did not produce a result.' >> "$summary"
+          fi
+          cat "$summary" >> "$GITHUB_STEP_SUMMARY"

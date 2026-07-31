@@ -19,7 +19,10 @@ use tokio::{
     time::{sleep, timeout},
 };
 
-use crate::{AUTH_KEY, ScenarioResult, ScenarioSpec};
+use crate::{
+    AUTH_KEY, ScenarioResult, ScenarioSpec,
+    telemetry::{TelemetryConfig, TelemetrySampler},
+};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const STARTUP_ATTEMPTS: u8 = 3;
@@ -38,6 +41,12 @@ pub struct RunConfig {
     pub spec: ScenarioSpec,
 }
 
+struct RtcWorkerArtifacts<'a> {
+    result: &'a Path,
+    spec: &'a Path,
+    samples: &'a Path,
+}
+
 /// Runs the isolated server and RTC processes then validates their result.
 ///
 /// # Errors
@@ -52,7 +61,14 @@ pub async fn run(config: RunConfig) -> Result<ScenarioResult> {
         .context("failed to create the artifact directory")?;
 
     let result_path = config.output_directory.join("result.json");
+    let spec_path = config.output_directory.join("scenario.json");
+    let samples_path = config.output_directory.join("samples.jsonl");
     remove_stale_result(&result_path).await?;
+    let encoded_spec = serde_json::to_vec_pretty(&config.spec)
+        .context("failed to encode the scenario specification")?;
+    fs::write(&spec_path, encoded_spec)
+        .await
+        .context("failed to write scenario.json")?;
     let mut shutdown_signals = ShutdownSignals::new()?;
     let (mut server, base_url, websocket_url) =
         start_server(&config, &mut shutdown_signals).await?;
@@ -62,7 +78,11 @@ pub async fn run(config: RunConfig) -> Result<ScenarioResult> {
             &config,
             &base_url,
             &websocket_url,
-            &result_path,
+            RtcWorkerArtifacts {
+                result: &result_path,
+                spec: &spec_path,
+                samples: &samples_path,
+            },
             &mut server,
             &mut shutdown_signals,
         )
@@ -147,7 +167,7 @@ fn spawn_server(config: &RunConfig, http_port: u16) -> Result<Child> {
         .context("failed to create the o-sfu stdout log")?;
     let stderr = File::create(config.output_directory.join("o-sfu.stderr.log"))
         .context("failed to create the o-sfu stderr log")?;
-    let room_size = config.spec.receivers() + 1;
+    let policy = crate::ServerPolicy::for_scenario(config.spec);
     let mut command = isolated_command(&config.server_binary, config.server_cpus.as_deref());
     command
         .env("ANNOUNCED_IP", Ipv4Addr::LOCALHOST.to_string())
@@ -156,8 +176,18 @@ fn spawn_server(config: &RunConfig, http_port: u16) -> Result<Child> {
             "BIND_ADDRESS",
             format!("{}:{http_port}", Ipv4Addr::LOCALHOST),
         )
-        .env("ROOM_SIZE", room_size.to_string())
-        .env("RTC_MEDIA_WORKER_COUNT", "1")
+        .env("ROOM_SIZE", policy.room_size.to_string())
+        .env("RTC_MEDIA_WORKER_COUNT", policy.media_workers.to_string())
+        .env(
+            "ROOM_MAX_ACTIVE_AUDIO_SPEAKERS",
+            policy.max_active_audio_speakers.to_string(),
+        )
+        .env(
+            "ROOM_MAX_VIDEO_DOWNLOADS_PER_RECEIVER",
+            policy.max_video_downloads_per_receiver.to_string(),
+        )
+        .env("MAX_BITRATE_IN", policy.max_bitrate_in_bps.to_string())
+        .env("MAX_BITRATE_OUT", policy.max_bitrate_out_bps.to_string())
         .env("RTC_MIN_PORT", "49152")
         .env("RTC_MAX_PORT", "65535")
         .env("RTC_UDP_IO_BACKEND", "tokio")
@@ -200,7 +230,7 @@ async fn run_rtc_worker(
     config: &RunConfig,
     base_url: &str,
     websocket_url: &str,
-    result_path: &Path,
+    artifacts: RtcWorkerArtifacts<'_>,
     server: &mut Child,
     shutdown_signals: &mut ShutdownSignals,
 ) -> Result<RtcWorkerCompletion> {
@@ -215,45 +245,64 @@ async fn run_rtc_worker(
         .arg("--websocket-url")
         .arg(websocket_url)
         .arg("--output")
-        .arg(result_path)
-        .arg("--receivers")
-        .arg(config.spec.receivers().to_string())
-        .arg("--packets")
-        .arg(config.spec.packets().to_string())
+        .arg(artifacts.result)
+        .arg("--spec")
+        .arg(artifacts.spec)
         .kill_on_drop(true)
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
     let mut rtc = command.spawn().context("failed to start the RTC worker")?;
+    let server_pid = server.id().context("o-sfu process has no process id")?;
+    let rtc_pid = rtc.id().context("RTC worker has no process id")?;
+    let telemetry = TelemetrySampler::start(TelemetryConfig::new(
+        base_url,
+        server_pid,
+        rtc_pid,
+        artifacts.samples,
+    ))
+    .await
+    .context("failed to start telemetry sampling")?;
     let deadline = rtc_worker_deadline(config.spec);
-    tokio::select! {
-        status = rtc.wait() => {
-            let status = status.context("failed to wait for the RTC worker")?;
-            ensure!(status.success(), "RTC worker exited with {status}");
-            Ok(RtcWorkerCompletion::Completed)
+    let completion = async {
+        tokio::select! {
+            status = rtc.wait() => {
+                let status = status.context("failed to wait for the RTC worker")?;
+                ensure!(status.success(), "RTC worker exited with {status}");
+                Ok(RtcWorkerCompletion::Completed)
+            }
+            status = server.wait() => {
+                let status = status.context("failed to wait for o-sfu during RTC work")?;
+                stop_rtc_worker(&mut rtc).await?;
+                Ok(RtcWorkerCompletion::ServerExited(status))
+            }
+            () = sleep(deadline) => {
+                stop_rtc_worker(&mut rtc).await?;
+                Err(anyhow!(
+                    "RTC worker exceeded its {} second deadline",
+                    deadline.as_secs()
+                ))
+            }
+            signal_result = shutdown_signals.recv() => {
+                let signal_error = signal_result.map_or_else(
+                    |error| error,
+                    |()| anyhow!("load run interrupted during RTC work"),
+                );
+                stop_rtc_worker(&mut rtc)
+                    .await
+                    .context("failed to stop the RTC worker after a shutdown signal")?;
+                Err(signal_error)
+            }
         }
-        status = server.wait() => {
-            let status = status.context("failed to wait for o-sfu during RTC work")?;
-            stop_rtc_worker(&mut rtc).await?;
-            Ok(RtcWorkerCompletion::ServerExited(status))
-        }
-        () = sleep(deadline) => {
-            stop_rtc_worker(&mut rtc).await?;
-            Err(anyhow!(
-                "RTC worker exceeded its {} second deadline",
-                deadline.as_secs()
-            ))
-        }
-        signal_result = shutdown_signals.recv() => {
-            let signal_error = signal_result.map_or_else(
-                |error| error,
-                |()| anyhow!("load run interrupted during RTC work"),
-            );
-            stop_rtc_worker(&mut rtc)
-                .await
-                .context("failed to stop the RTC worker after a shutdown signal")?;
-            Err(signal_error)
-        }
+    }
+    .await;
+    let telemetry_result = telemetry.finish().await;
+    match (completion, telemetry_result) {
+        (Ok(completion), Ok(_summary)) => Ok(completion),
+        (Err(error), Ok(_)) | (Ok(_), Err(error)) => Err(error),
+        (Err(run_error), Err(telemetry_error)) => Err(anyhow!(
+            "RTC work failed: {run_error:#}. telemetry shutdown also failed: {telemetry_error:#}"
+        )),
     }
 }
 
@@ -263,11 +312,11 @@ enum RtcWorkerCompletion {
 }
 
 fn rtc_worker_deadline(spec: ScenarioSpec) -> Duration {
-    let peer_count = u64::from(spec.receivers()).saturating_add(1);
+    let peer_count = u64::from(spec.peers_per_room());
     let setup_seconds = peer_count.saturating_mul(PEER_SETUP_TIMEOUT.as_secs());
-    let packet_milliseconds = u64::from(spec.packets()).saturating_mul(20);
+    let media_seconds = u64::from(spec.duration_seconds());
     Duration::from_secs(setup_seconds)
-        .saturating_add(Duration::from_millis(packet_milliseconds))
+        .saturating_add(Duration::from_secs(media_seconds))
         .saturating_add(RTC_WORKER_OVERHEAD)
 }
 

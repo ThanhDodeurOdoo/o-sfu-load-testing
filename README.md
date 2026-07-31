@@ -5,7 +5,7 @@ This repository drives the production
 [o-sfu](https://github.com/ThanhDodeurOdoo/o-sfu) server through its public
 HTTP, WebSocket and WebRTC boundaries.
 
-The foundation uses three binaries:
+The harness uses separate operating-system processes:
 
 ```text
 o-sfu-load
@@ -13,42 +13,109 @@ o-sfu-load
 └── o-sfu-load-rtc      str0m RTC peers on Tokio tasks
 ```
 
-The process boundary keeps SFU CPU and memory attribution separate from the
-RTC generator. Optional Linux CPU sets can place both processes on different
-logical CPUs. This reduces generator interference but does not remove
-GitHub-hosted runner or hypervisor noise.
+The process boundary attributes CPU and memory to the SFU or the generator.
+Linux CPU sets can place them on different logical CPUs. This reduces
+generator interference but does not remove hosted-runner and hypervisor noise.
 
-The initial scenario creates one audio publisher and one or more receivers. It
-uses the production room API, signaling protocol, ICE, DTLS, SRTP and UDP
-packet path. The run fails unless every receiver observes every fixed-work RTP
-payload in order.
+## Workloads
+
+`smoke` keeps the small one-publisher correctness test. `audio-mesh` makes
+every peer publish Opus and receive every other peer. `video-gallery` makes a
+bounded set of peers publish two-RID VP8 simulcast. Each peer selects one remote
+publisher as featured when available and receives other sources as thumbnails.
+
+The audio profile sends one synthetic 160-byte Opus RTP payload every 20 ms.
+That is 50 packets/s and 64 kbit/s per publisher. The realistic load comes from
+concurrent publishers, RTP cadence and fanout rather than encoded speech.
+
+The video profile sends synthetic VP8 RTP packet bursts at 30 frames/s with
+two-second keyframe signaling. Over each complete two-second profile the low
+RID averages 146.4 kbit/s and the high RID averages 3.7224 Mbit/s. Both RIDs use
+valid VP8 payload descriptors, PictureID, TL0PICIDX and marker semantics.
+Payload bodies carry deterministic identities rather than decodable video.
+
+Every measured payload carries an immutable source, layer, frame and fragment
+identity. Receivers validate each source-to-receiver route independently.
+Cross-source arrival may interleave while within-source ordering, exact packet
+counts, payload bytes and duplicate freedom remain required. Warmup identities
+cannot satisfy measured work.
 
 ## Build and run
 
 ```bash
 cargo build --locked --release --bins
+
 target/release/o-sfu-load \
   --server-binary target/release/o-sfu-load-server \
   --rtc-binary target/release/o-sfu-load-rtc \
-  --receivers 1 \
-  --packets 50
+  --output artifacts/smoke \
+  smoke --receivers 1 --packets 50
+
+target/release/o-sfu-load \
+  --server-binary target/release/o-sfu-load-server \
+  --rtc-binary target/release/o-sfu-load-rtc \
+  --output artifacts/audio \
+  audio-mesh --rooms 1 --peers 8 --seconds 30
+
+target/release/o-sfu-load \
+  --server-binary target/release/o-sfu-load-server \
+  --rtc-binary target/release/o-sfu-load-rtc \
+  --output artifacts/video \
+  video-gallery --rooms 1 --peers 12 --publishers 4 --seconds 30
 ```
 
-Linux runs can partition CPU time:
+Linux runs can isolate the o-sfu process from the RTC generator:
 
 ```bash
 target/release/o-sfu-load \
   --server-binary target/release/o-sfu-load-server \
   --rtc-binary target/release/o-sfu-load-rtc \
-  --server-cpus 0,1 \
-  --rtc-cpus 2,3
+  --server-cpus 0 \
+  --rtc-cpus 1-3 \
+  audio-mesh --rooms 1 --peers 8 --seconds 30
 ```
 
-Results and child logs are written under `artifacts/`. `result.json` records
-exact delivery, achieved delivery rate and payload digests. The sender offers
-one packet every 20 ms so this foundation measures whether o-sfu keeps up with
-the requested work. It does not claim to measure saturation throughput.
-`Cargo.lock` pins the exact o-sfu commit resolved from the Git dependency.
+Each output directory contains the typed scenario, exact result, child logs and
+one-second telemetry samples. Linux telemetry records separate SFU and RTC CPU
+plus RSS. It also records o-sfu RTP counters and worker pressure diagnostics.
+
+`o-sfu-load-report` combines one or more results into GitHub-flavored Markdown:
+
+```bash
+target/release/o-sfu-load-report \
+  --input artifacts/audio \
+  --input artifacts/video \
+  --output artifacts/summary.md
+```
+
+The report contains common-scale delivery graphs, packet discrepancy tables
+and separate SFU and generator CPU plus RSS graphs. Raw JSONL and logs remain
+available as workflow artifacts.
+
+## GitHub Actions
+
+CI runs the bounded smoke. The nightly workflow runs these fixed profiles
+using four assigned logical CPUs:
+
+| Profile | Exact expected deliveries |
+| --- | ---: |
+| 1 room × 8 audio peers × 30 s | 84,000 |
+| 2 rooms × 12 audio peers × 60 s | 792,000 |
+| 4 rooms × 16 audio peers × 90 s | 4,320,000 |
+| 1 room × 12 peers × 4 cameras × 30 s | 181,560 |
+
+The nightly run therefore requires 5,377,560 exact forwarded deliveries. Its
+job summary renders the graphs directly without requiring an artifact download.
+Artifacts retain the detailed evidence.
+
+Shared GitHub runners make CPU, RSS and rate measurements trend data. Exact
+packet delivery and clean process shutdown are deterministic gates. The nightly
+workflow resolves the current o-sfu `master` revision and records its full Git
+commit in every result.
+
+The summary marks a performance sample invalid when generator send lag exceeds
+one audio packet or video frame interval. That warning does not turn shared-runner
+timing into a deterministic gate.
 
 ## Verification
 
@@ -58,6 +125,3 @@ cargo check --locked
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 cargo test --locked --workspace --release
 ```
-
-Performance comparisons on shared GitHub runners are diagnostic. Exact packet
-delivery and clean process shutdown are required.

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use o_sfu_load_testing::{
     ScenarioSpec,
     controller::{RunConfig, run},
@@ -16,20 +16,59 @@ struct Cli {
     rtc_binary: PathBuf,
     #[arg(long, default_value = "artifacts")]
     output: PathBuf,
-    #[arg(long, default_value_t = 1)]
-    receivers: u32,
-    #[arg(long, default_value_t = 50)]
-    packets: u32,
     #[arg(long)]
     server_cpus: Option<String>,
     #[arg(long)]
     rtc_cpus: Option<String>,
+    #[command(subcommand)]
+    scenario: ScenarioCommand,
+}
+
+#[derive(Subcommand)]
+enum ScenarioCommand {
+    Smoke {
+        #[arg(long, default_value_t = 1)]
+        receivers: u32,
+        #[arg(long, default_value_t = 50)]
+        packets: u32,
+    },
+    AudioMesh {
+        #[arg(long)]
+        rooms: u32,
+        #[arg(long)]
+        peers: u32,
+        #[arg(long)]
+        seconds: u32,
+    },
+    VideoGallery {
+        #[arg(long)]
+        rooms: u32,
+        #[arg(long)]
+        peers: u32,
+        #[arg(long)]
+        publishers: u32,
+        #[arg(long)]
+        seconds: u32,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let spec = ScenarioSpec::new(cli.receivers, cli.packets)?;
+    let spec = match cli.scenario {
+        ScenarioCommand::Smoke { receivers, packets } => ScenarioSpec::smoke(receivers, packets)?,
+        ScenarioCommand::AudioMesh {
+            rooms,
+            peers,
+            seconds,
+        } => ScenarioSpec::audio_mesh(rooms, peers, seconds)?,
+        ScenarioCommand::VideoGallery {
+            rooms,
+            peers,
+            publishers,
+            seconds,
+        } => ScenarioSpec::video_gallery(rooms, peers, publishers, seconds)?,
+    };
     run(RunConfig {
         server_binary: cli.server_binary,
         rtc_binary: cli.rtc_binary,

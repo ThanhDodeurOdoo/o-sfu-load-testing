@@ -1,0 +1,107 @@
+name: Nightly load
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-load
+  cancel-in-progress: false
+
+jobs:
+  load:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchains
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --component clippy
+          rustup toolchain install nightly-2026-04-20 --profile minimal --component rustfmt
+
+      - name: Resolve current o-sfu master
+        run: cargo update -p o-sfu
+
+      - name: Build isolated processes
+        run: cargo build --locked --release --bins
+
+      - name: Check runner isolation
+        run: |
+          logical_cpus=$(nproc)
+          if (( logical_cpus < 4 )); then
+            echo "nightly load requires at least four logical CPUs, found $logical_cpus" >&2
+            exit 1
+          fi
+          taskset --cpu-list 0 true
+          taskset --cpu-list 1-3 true
+
+      - name: Run deterministic load profiles
+        run: |
+          status=0
+          run_load() {
+            target/release/o-sfu-load \
+              --server-binary target/release/o-sfu-load-server \
+              --rtc-binary target/release/o-sfu-load-rtc \
+              --server-cpus 0 \
+              --rtc-cpus 1-3 \
+              "$@" || status=1
+          }
+
+          run_load --output artifacts/audio-1x8 audio-mesh \
+            --rooms 1 --peers 8 --seconds 30
+          run_load --output artifacts/audio-2x12 audio-mesh \
+            --rooms 2 --peers 12 --seconds 60
+          run_load --output artifacts/audio-4x16 audio-mesh \
+            --rooms 4 --peers 16 --seconds 90
+          run_load --output artifacts/video-1x12 video-gallery \
+            --rooms 1 --peers 12 --publishers 4 --seconds 30
+
+          exit "$status"
+
+      - name: Upload load artifacts
+        id: load-artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: nightly-load-results
+          path: |
+            artifacts
+            Cargo.lock
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Publish load summary
+        if: always()
+        env:
+          ARTIFACT_URL: ${{ steps.load-artifact.outputs.artifact-url }}
+        run: |
+          mkdir -p artifacts
+          summary=artifacts/summary.md
+          if [[ -x target/release/o-sfu-load-report ]]; then
+            args=(
+              --input artifacts/audio-1x8
+              --input artifacts/audio-2x12
+              --input artifacts/audio-4x16
+              --input artifacts/video-1x12
+              --output "$summary"
+            )
+            if [[ -n "$ARTIFACT_URL" ]]; then
+              args+=(--artifact-url "$ARTIFACT_URL")
+            fi
+            target/release/o-sfu-load-report "${args[@]}"
+          else
+            echo '# o-sfu load report' > "$summary"
+            echo >> "$summary"
+            echo 'No load scenario produced a result.' >> "$summary"
+          fi
+
+          cat "$summary" >> "$GITHUB_STEP_SUMMARY"

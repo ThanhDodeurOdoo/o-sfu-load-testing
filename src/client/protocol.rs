@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
 use o_sfu_protocol::{
     host::{Command, CommandBatch, ProtocolCore},
-    wire::StreamType,
+    wire::{DownloadStates, StreamType, UserId, VideoLayoutIntent},
 };
 use tokio::{
     net::TcpStream,
@@ -17,7 +17,10 @@ use tokio::{
 };
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
-use super::{media::AudioPacket, rtc::RtcPeer};
+use super::{
+    media::{AudioPacket, VideoPacket},
+    rtc::RtcPeer,
+};
 
 type TestWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -58,7 +61,38 @@ impl ProtocolPeer {
     }
 
     pub async fn publish_audio(&mut self) -> Result<()> {
-        let commands = self.core.publish(StreamType::Audio, true);
+        Box::pin(self.publish(StreamType::Audio)).await
+    }
+
+    pub async fn publish_camera(&mut self) -> Result<()> {
+        Box::pin(self.publish(StreamType::Camera)).await
+    }
+
+    pub async fn set_camera_layouts(
+        &mut self,
+        layouts: impl IntoIterator<Item = (UserId, VideoLayoutIntent)>,
+    ) -> Result<()> {
+        let mut changed = false;
+        for (user_id, camera_layout) in layouts {
+            changed = true;
+            let commands = self.core.subscribe(
+                user_id,
+                DownloadStates {
+                    camera: Some(!matches!(camera_layout, VideoLayoutIntent::Hidden)),
+                    camera_layout: Some(camera_layout),
+                    ..DownloadStates::default()
+                },
+            );
+            Box::pin(self.run_commands(commands)).await?;
+        }
+        if changed {
+            Box::pin(self.flush_next_timer()).await?;
+        }
+        Ok(())
+    }
+
+    async fn publish(&mut self, stream_type: StreamType) -> Result<()> {
+        let commands = self.core.publish(stream_type, true);
         Box::pin(self.run_commands(commands)).await?;
         Box::pin(self.flush_next_timer()).await?;
         let expected_negotiations = self.negotiation_count + 1;
@@ -68,14 +102,6 @@ impl ProtocolPeer {
     pub async fn accept_next_negotiation(&mut self) -> Result<()> {
         let expected_negotiations = self.negotiation_count + 1;
         Box::pin(self.read_until_negotiation(expected_negotiations)).await
-    }
-
-    pub async fn send_audio_packet(&mut self, packet: AudioPacket) -> Result<Vec<u8>> {
-        self.rtc_mut()?.send_audio_packet(packet).await
-    }
-
-    pub async fn read_rtp_payload(&mut self, timeout_window: Duration) -> Result<Option<Vec<u8>>> {
-        self.rtc_mut()?.read_rtp_payload(timeout_window).await
     }
 
     pub fn into_load_peer(mut self) -> Result<LoadPeer> {
@@ -151,9 +177,9 @@ impl ProtocolPeer {
                     request_id,
                     kind,
                     sdp,
-                    upload_slots: _,
+                    upload_slots,
                 } => {
-                    let answer = self.rtc_mut()?.answer_offer(&sdp).await?;
+                    let answer = self.rtc_mut()?.answer_offer(&sdp, &upload_slots).await?;
                     pending.extend(
                         self.core
                             .submit_negotiation_answer(&request_id, kind, answer)
@@ -196,7 +222,11 @@ impl ProtocolPeer {
 }
 
 impl LoadPeer {
-    pub async fn send_audio_packet(&mut self, packet: AudioPacket) -> Result<Vec<u8>> {
+    pub fn reset_send_pacing(&mut self) {
+        self.rtc.reset_send_pacing();
+    }
+
+    pub async fn send_audio_packet(&mut self, packet: AudioPacket) -> Result<usize> {
         self.check_signaling().await?;
         let payload = self.rtc.send_audio_packet(packet).await?;
         self.check_signaling().await?;
@@ -206,6 +236,13 @@ impl LoadPeer {
     pub async fn read_rtp_payload(&mut self, timeout_window: Duration) -> Result<Option<Vec<u8>>> {
         self.check_signaling().await?;
         let payload = self.rtc.read_rtp_payload(timeout_window).await?;
+        self.check_signaling().await?;
+        Ok(payload)
+    }
+
+    pub async fn send_video_packet(&mut self, packet: VideoPacket) -> Result<usize> {
+        self.check_signaling().await?;
+        let payload = self.rtc.send_video_packet(packet).await?;
         self.check_signaling().await?;
         Ok(payload)
     }
@@ -281,12 +318,7 @@ async fn service_signaling(
                         .send(Message::Pong(payload))
                         .await
                         .context("failed to answer an o-sfu WebSocket ping")?,
-                    Message::Pong(_) => {}
-                    Message::Text(_) => {
-                        return Err(anyhow!(
-                            "o-sfu requested signaling after fixed work started"
-                        ));
-                    }
+                    Message::Pong(_) | Message::Text(_) => {}
                     Message::Binary(_) | Message::Close(_) | Message::Frame(_) => {
                         return Err(anyhow!(
                             "o-sfu sent an unexpected fixed-work WebSocket frame"

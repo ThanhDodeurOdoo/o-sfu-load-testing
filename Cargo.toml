@@ -32,7 +32,6 @@ o-sfu-rfc = { git = "https://github.com/ThanhDodeurOdoo/o-sfu", branch = "master
 reqwest = { version = "0.13", default-features = false, features = ["json", "query"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sha2 = "0.11"
 str0m = { version = "0.21", default-features = false, features = ["aws-lc-rs"] }
 tokio = { version = "1.52", features = [
     "fs",
@@ -121,3 +120,7 @@ path = "src/bin/o-sfu-load-server.rs"
 [[bin]]
 name = "o-sfu-load-rtc"
 path = "src/bin/o-sfu-load-rtc.rs"
+
+[[bin]]
+name = "o-sfu-load-report"
+path = "src/bin/o-sfu-load-report.rs"
