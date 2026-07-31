@@ -16,6 +16,8 @@ o-sfu-load
 The process boundary attributes CPU and memory to the SFU or the generator.
 Linux CPU sets can place them on different logical CPUs. This reduces
 generator interference but does not remove hosted-runner and hypervisor noise.
+The server admission cap matches the total synthetic peer count because every
+local client shares one loopback origin.
 
 ## Workloads
 

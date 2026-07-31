@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::O_SFU_REVISION;
 
-pub const RESULT_SCHEMA_VERSION: u32 = 2;
+pub const RESULT_SCHEMA_VERSION: u32 = 3;
 pub const AUDIO_PACKETS_PER_SECOND: u32 = 50;
 pub const AUDIO_PACKET_PAYLOAD_BYTES: usize = 160;
 pub const VIDEO_FRAMES_PER_SECOND: u32 = 30;
@@ -294,6 +294,7 @@ impl WorkloadPlan {
 pub struct ServerPolicy {
     pub media_workers: u32,
     pub room_size: u32,
+    pub max_pre_auth_websocket_sessions_per_origin: u32,
     pub max_active_audio_speakers: u32,
     pub max_video_downloads_per_receiver: u32,
     pub max_bitrate_in_bps: u64,
@@ -306,6 +307,9 @@ impl ServerPolicy {
         Self {
             media_workers: 1,
             room_size: spec.peers_per_room(),
+            max_pre_auth_websocket_sessions_per_origin: spec
+                .room_count()
+                .saturating_mul(spec.peers_per_room()),
             max_active_audio_speakers: spec.active_audio_speakers(),
             max_video_downloads_per_receiver: 10,
             max_bitrate_in_bps: 8_000_000,

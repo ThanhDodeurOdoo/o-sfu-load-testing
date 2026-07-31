@@ -247,13 +247,14 @@ fn run(
     let plan = spec.plan()?;
     let delivered_packets = delivered_packets.unwrap_or(plan.expected_deliveries);
     let result = serde_json::from_value::<ScenarioResult>(json!({
-        "schemaVersion": 2,
+        "schemaVersion": 3,
         "profile": spec.profile(),
         "oSfuRevision": "deadbeef",
         "scenario": spec,
         "serverPolicy": {
             "mediaWorkers": 1,
             "roomSize": spec.peers_per_room(),
+            "maxPreAuthWebsocketSessionsPerOrigin": spec.room_count() * spec.peers_per_room(),
             "maxActiveAudioSpeakers": spec.active_audio_speakers(),
             "maxVideoDownloadsPerReceiver": 10,
             "maxBitrateInBps": 8_000_000,

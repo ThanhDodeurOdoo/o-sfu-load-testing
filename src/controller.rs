@@ -179,6 +179,12 @@ fn spawn_server(config: &RunConfig, http_port: u16) -> Result<Child> {
         .env("ROOM_SIZE", policy.room_size.to_string())
         .env("RTC_MEDIA_WORKER_COUNT", policy.media_workers.to_string())
         .env(
+            "MAX_PRE_AUTH_WEBSOCKET_SESSIONS_PER_ORIGIN",
+            policy
+                .max_pre_auth_websocket_sessions_per_origin
+                .to_string(),
+        )
+        .env(
             "ROOM_MAX_ACTIVE_AUDIO_SPEAKERS",
             policy.max_active_audio_speakers.to_string(),
         )

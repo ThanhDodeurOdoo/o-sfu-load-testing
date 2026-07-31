@@ -1,4 +1,4 @@
-use super::{CorrectnessSummary, RunObservation, ScenarioResult, ScenarioSpec};
+use super::{CorrectnessSummary, RunObservation, ScenarioResult, ScenarioSpec, ServerPolicy};
 
 #[test]
 fn smoke_plan_preserves_foundation_cardinality() -> anyhow::Result<()> {
@@ -87,4 +87,15 @@ fn malformed_scenario_plans_return_errors() {
         .plan()
         .is_err()
     );
+}
+
+#[test]
+fn server_admission_matches_concurrent_peer_count() -> anyhow::Result<()> {
+    let spec = ScenarioSpec::audio_mesh(4, 16, 1)?;
+
+    assert_eq!(
+        ServerPolicy::for_scenario(spec).max_pre_auth_websocket_sessions_per_origin,
+        64
+    );
+    Ok(())
 }
