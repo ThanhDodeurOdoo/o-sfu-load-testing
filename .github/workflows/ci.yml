@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchains
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --component clippy
+          rustup toolchain install nightly-2026-04-20 --profile minimal --component rustfmt
+
+      - name: Check formatting
+        run: cargo +nightly-2026-04-20 fmt --all -- --check
+
+      - name: Check workspace
+        run: cargo check --locked
+
+      - name: Lint workspace
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+
+      - name: Test workspace
+        run: cargo test --locked --workspace --release
+
+      - name: Build isolated processes
+        run: cargo build --locked --release --bins
+
+      - name: Run RTC boundary smoke
+        run: |
+          exec target/release/o-sfu-load \
+            --server-binary target/release/o-sfu-load-server \
+            --rtc-binary target/release/o-sfu-load-rtc \
+            --receivers 1 \
+            --packets 50 \
+            --output artifacts/smoke
+
+      - name: Upload smoke artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: rtc-boundary-smoke
+          path: artifacts/smoke
+          if-no-files-found: warn
+          retention-days: 30

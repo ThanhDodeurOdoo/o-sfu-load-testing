@@ -1,0 +1,11 @@
+edition = "2024"
+max_width = 100
+use_field_init_shorthand = true
+use_try_shorthand = true
+reorder_imports = true
+reorder_modules = true
+newline_style = "Unix"
+
+# nightly
+imports_granularity = "Crate"
+group_imports = "StdExternalCrate"
