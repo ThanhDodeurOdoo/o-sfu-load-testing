@@ -106,9 +106,9 @@ target/release/o-sfu-load-report \
 ```
 
 It requires identical scenario, profile, server policy and workload plans.
-Each Mermaid graph uses baseline bars plus comparison lines on one scenario
-axis. Tables show comparison-minus-baseline deltas beside exact delivery
-evidence. The report includes a label legend. For example
+Each Mermaid graph places adjacent `B` baseline and `C` comparison bars on one
+scenario axis. Tables show comparison-minus-baseline deltas beside exact
+delivery evidence. The report includes a label legend. For example
 `video-gallery-1x64-10p-60s` means one room with 64 peers, 10 video publishers
 per room and a 60 second workload.
 

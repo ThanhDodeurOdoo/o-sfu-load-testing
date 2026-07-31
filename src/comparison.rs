@@ -9,12 +9,14 @@ use std::{
 use anyhow::{Context, Result, ensure};
 
 use crate::report::{
-    ChartPlot, LoadFailure, MAX_INPUTS, RunData, TelemetrySummary, chart_label,
-    delivered_payload_bits_per_second, delivery_rate, ensure_summary_size, escape_table,
-    format_bits_per_second, format_cpu_percent, format_mebibytes, format_milliseconds, load_run,
-    pacing_valid, render_chart, render_scenario_legend, scenario_key, scenario_label,
-    validate_artifact_url, validate_run,
+    ChartPlot, LoadFailure, MAX_CHART_SCENARIOS, MAX_INPUTS, RunData, TelemetrySummary,
+    chart_label, delivered_payload_bits_per_second, delivery_rate, ensure_summary_size,
+    escape_table, format_bits_per_second, format_cpu_percent, format_mebibytes,
+    format_milliseconds, load_run, pacing_valid, render_chart, render_scenario_legend,
+    scenario_key, scenario_label, validate_artifact_url, validate_run,
 };
+
+const COMPARISON_SCENARIOS_PER_CHART: usize = MAX_CHART_SCENARIOS / 2;
 
 struct Side {
     runs: Vec<RunData>,
@@ -82,11 +84,9 @@ pub fn render(
         "at most 256 comparison inputs are allowed"
     );
     validate_artifact_url(artifact_url)?;
-    render_sides(
-        load_side(baseline_inputs),
-        load_side(comparison_inputs),
-        artifact_url,
-    )
+    let baseline = load_side(baseline_inputs);
+    let comparison = load_side(comparison_inputs);
+    render_sides(&baseline, &comparison, artifact_url)
 }
 
 /// Writes a paired o-sfu revision comparison to `output`.
@@ -131,7 +131,7 @@ fn load_side(inputs: &[PathBuf]) -> Side {
     Side { runs, failures }
 }
 
-fn render_sides(baseline: Side, comparison: Side, artifact_url: Option<&str>) -> Result<String> {
+fn render_sides(baseline: &Side, comparison: &Side, artifact_url: Option<&str>) -> Result<String> {
     let baseline_revision = revision(&baseline.runs);
     let comparison_revision = revision(&comparison.runs);
     let pairing = pair_runs(&baseline.runs, &comparison.runs);
@@ -162,9 +162,9 @@ fn render_sides(baseline: Side, comparison: Side, artifact_url: Option<&str>) ->
     writeln!(output, "# o-sfu revision comparison\n")?;
     render_status(
         &mut output,
-        Status {
-            baseline: &baseline,
-            comparison: &comparison,
+        &Status {
+            baseline,
+            comparison,
             baseline_revision: &baseline_revision,
             comparison_revision: &comparison_revision,
             workloads_match,
@@ -175,8 +175,8 @@ fn render_sides(baseline: Side, comparison: Side, artifact_url: Option<&str>) ->
     )?;
     render_issues(
         &mut output,
-        &baseline,
-        &comparison,
+        baseline,
+        comparison,
         &baseline_revision,
         &comparison_revision,
         &pairing,
@@ -200,7 +200,7 @@ fn render_sides(baseline: Side, comparison: Side, artifact_url: Option<&str>) ->
     Ok(output)
 }
 
-fn render_status(output: &mut String, status: Status<'_>) -> Result<()> {
+fn render_status(output: &mut String, status: &Status<'_>) -> Result<()> {
     let revisions_valid = status.baseline_revision.valid
         && status.comparison_revision.valid
         && status.baseline_revision.label != status.comparison_revision.label;
@@ -313,23 +313,18 @@ fn render_workload_identity(output: &mut String, pairs: &[RunPair<'_>]) -> Resul
     writeln!(output, "## Workload identity\n")?;
     writeln!(
         output,
-        "| Scenario | Profile | Expected deliveries | Duration | Contract |"
+        "| Scenario | Profile | Expected deliveries | Duration |"
     )?;
-    writeln!(output, "| --- | --- | ---: | ---: | --- |")?;
+    writeln!(output, "| --- | --- | ---: | ---: |")?;
     for pair in pairs {
         let result = &pair.baseline.result;
         writeln!(
             output,
-            "| {} | {} | {} | {} s | {} |",
+            "| {} | {} | {} | {} s |",
             scenario_label(result.scenario),
             escape_table(&result.profile),
             grouped(result.plan.expected_deliveries),
-            result.scenario.duration_seconds(),
-            if pair.workload_matches {
-                "IDENTICAL"
-            } else {
-                "MISMATCH"
-            }
+            result.scenario.duration_seconds()
         )?;
     }
     writeln!(output)?;
@@ -386,7 +381,7 @@ fn render_graphs(
     writeln!(output, "## Comparison graphs\n")?;
     writeln!(
         output,
-        "Bars show baseline `{}`. Lines show comparison `{}`.\n",
+        "Every scenario uses adjacent `B` and `C` bars. `B` is baseline `{}`. `C` is comparison `{}`.\n",
         short_revision(baseline_revision, "baseline"),
         short_revision(comparison_revision, "comparison")
     )?;
@@ -395,7 +390,7 @@ fn render_graphs(
 }
 
 fn render_delivery_graphs(output: &mut String, metrics: &[PairMetrics<'_>]) -> Result<()> {
-    render_overlay(
+    render_paired_bars(
         output,
         metrics,
         "Receiver delivery throughput",
@@ -408,7 +403,7 @@ fn render_delivery_graphs(output: &mut String, metrics: &[PairMetrics<'_>]) -> R
             )
         },
     )?;
-    render_overlay(
+    render_paired_bars(
         output,
         metrics,
         "Receiver-observed RTP payload",
@@ -425,7 +420,7 @@ fn render_delivery_graphs(output: &mut String, metrics: &[PairMetrics<'_>]) -> R
 }
 
 fn render_system_graphs(output: &mut String, metrics: &[PairMetrics<'_>]) -> Result<()> {
-    render_overlay(
+    render_paired_bars(
         output,
         metrics,
         "SFU CPU time per million deliveries",
@@ -444,7 +439,7 @@ fn render_system_graphs(output: &mut String, metrics: &[PairMetrics<'_>]) -> Res
             )
         },
     )?;
-    render_overlay(
+    render_paired_bars(
         output,
         metrics,
         "Generator send lag",
@@ -457,7 +452,7 @@ fn render_system_graphs(output: &mut String, metrics: &[PairMetrics<'_>]) -> Res
             )
         },
     )?;
-    render_overlay(
+    render_paired_bars(
         output,
         metrics,
         "SFU packet-loop delay",
@@ -470,7 +465,7 @@ fn render_system_graphs(output: &mut String, metrics: &[PairMetrics<'_>]) -> Res
             )
         },
     )?;
-    render_overlay(
+    render_paired_bars(
         output,
         metrics,
         "SFU average CPU",
@@ -483,7 +478,7 @@ fn render_system_graphs(output: &mut String, metrics: &[PairMetrics<'_>]) -> Res
             )
         },
     )?;
-    render_overlay(
+    render_paired_bars(
         output,
         metrics,
         "SFU peak resident memory",
@@ -499,28 +494,24 @@ fn render_system_graphs(output: &mut String, metrics: &[PairMetrics<'_>]) -> Res
     Ok(())
 }
 
-fn render_overlay<F>(
+fn render_paired_bars<F>(
     output: &mut String,
     metrics: &[PairMetrics<'_>],
     title: &str,
     y_axis: &str,
     minimum: u64,
-    values: F,
+    metric_values: F,
 ) -> Result<()>
 where
     F: Fn(&PairMetrics<'_>) -> (Option<u64>, Option<u64>),
 {
-    let mut labels = Vec::new();
-    let mut baseline = Vec::new();
-    let mut comparison = Vec::new();
+    let mut paired = Vec::new();
     let mut omitted = Vec::new();
     for metric in metrics.iter().filter(|metric| metric.pair.workload_matches) {
         let label = chart_label(metric.pair.baseline.result.scenario);
-        match values(metric) {
+        match metric_values(metric) {
             (Some(baseline_value), Some(comparison_value)) => {
-                labels.push(label);
-                baseline.push(baseline_value);
-                comparison.push(comparison_value);
+                paired.push((label, baseline_value, comparison_value));
             }
             _ => omitted.push(label),
         }
@@ -532,19 +523,34 @@ where
             omitted.join(", ")
         )?;
     }
-    if labels.is_empty() {
+    if paired.is_empty() {
         writeln!(output, "The {title} graph has no paired data.\n")?;
         return Ok(());
     }
-    render_chart(
-        output,
-        title,
-        "Baseline bars and comparison lines share one scenario axis.",
-        &labels,
-        y_axis,
-        minimum,
-        &[ChartPlot::Bar(&baseline), ChartPlot::Line(&comparison)],
-    )
+    let chunk_count = paired.len().div_ceil(COMPARISON_SCENARIOS_PER_CHART);
+    for (index, chunk) in paired.chunks(COMPARISON_SCENARIOS_PER_CHART).enumerate() {
+        let mut labels = Vec::with_capacity(chunk.len() * 2);
+        let mut values = Vec::with_capacity(chunk.len() * 2);
+        for (label, baseline, comparison) in chunk {
+            labels.extend([format!("B {label}"), format!("C {label}")]);
+            values.extend([*baseline, *comparison]);
+        }
+        let chart_title = if chunk_count == 1 {
+            title.to_owned()
+        } else {
+            format!("{title} ({}/{chunk_count})", index + 1)
+        };
+        render_chart(
+            output,
+            &chart_title,
+            "Adjacent B and C bars compare both revisions on one scale.",
+            &labels,
+            y_axis,
+            minimum,
+            &[ChartPlot::Bar(&values)],
+        )?;
+    }
+    Ok(())
 }
 
 fn render_performance_table(output: &mut String, metrics: &[PairMetrics<'_>]) -> Result<()> {
