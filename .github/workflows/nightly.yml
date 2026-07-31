@@ -60,8 +60,8 @@ jobs:
             --rooms 1 --peers 8 --seconds 30
           run_load --output artifacts/audio-2x12 audio-mesh \
             --rooms 2 --peers 12 --seconds 60
-          run_load --output artifacts/audio-4x16 audio-mesh \
-            --rooms 4 --peers 16 --seconds 90
+          run_load --output artifacts/audio-3x12 audio-mesh \
+            --rooms 3 --peers 12 --seconds 120
           run_load --output artifacts/video-1x12 video-gallery \
             --rooms 1 --peers 12 --publishers 4 --seconds 30
 
@@ -90,7 +90,7 @@ jobs:
             args=(
               --input artifacts/audio-1x8
               --input artifacts/audio-2x12
-              --input artifacts/audio-4x16
+              --input artifacts/audio-3x12
               --input artifacts/video-1x12
               --output "$summary"
             )

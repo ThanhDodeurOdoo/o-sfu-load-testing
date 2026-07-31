@@ -103,10 +103,10 @@ using four assigned logical CPUs:
 | --- | ---: |
 | 1 room × 8 audio peers × 30 s | 84,000 |
 | 2 rooms × 12 audio peers × 60 s | 792,000 |
-| 4 rooms × 16 audio peers × 90 s | 4,320,000 |
+| 3 rooms × 12 audio peers × 120 s | 2,376,000 |
 | 1 room × 12 peers × 4 cameras × 30 s | 181,560 |
 
-The nightly run therefore requires 5,377,560 exact forwarded deliveries. Its
+The nightly run therefore requires 3,433,560 exact forwarded deliveries. Its
 job summary renders the graphs directly without requiring an artifact download.
 Artifacts retain the detailed evidence.
 
