@@ -359,9 +359,8 @@ impl PeerMedia {
             .map(VideoSource::next_emitted_at);
         match (audio_due, video_due) {
             (Some(audio), Some(video)) if audio <= video => Some(MediaTurn::Audio),
-            (Some(_), Some(_)) => Some(MediaTurn::Video),
+            (Some(_), Some(_)) | (None, Some(_)) => Some(MediaTurn::Video),
             (Some(_), None) => Some(MediaTurn::Audio),
-            (None, Some(_)) => Some(MediaTurn::Video),
             (None, None) => None,
         }
     }
@@ -380,22 +379,7 @@ async fn run_media_peer(
     sync: ScenarioSync,
 ) -> Result<RunObservation> {
     sync.barrier.wait().await;
-    if let Some(source) = media.audio.as_mut() {
-        for ordinal in 0..WARMUP_AUDIO_PACKETS {
-            let _payload_len = peer
-                .send_audio_packet(source.next_packet(PacketPhase::Warmup, ordinal))
-                .await?;
-            drain_pending(&mut peer, &mut ledger).await?;
-        }
-    }
-    if let Some(source) = media.video.as_mut() {
-        for frame in 0..WARMUP_VIDEO_FRAMES {
-            for packet in source.next_frame(PacketPhase::Warmup, frame) {
-                let _payload_len = peer.send_video_packet(packet).await?;
-                drain_pending(&mut peer, &mut ledger).await?;
-            }
-        }
-    }
+    send_warmup(&mut peer, &mut media, &mut ledger).await?;
     drain_for(&mut peer, &mut ledger, ROUTE_SETTLE_TIME).await?;
     sync.barrier.wait().await;
     media.reset_timelines();
@@ -445,6 +429,30 @@ async fn run_media_peer(
     observation.correctness = ledger.finish();
     peer.close().await?;
     Ok(observation)
+}
+
+async fn send_warmup(
+    peer: &mut LoadPeer,
+    media: &mut PeerMedia,
+    ledger: &mut PacketLedger,
+) -> Result<()> {
+    if let Some(source) = media.audio.as_mut() {
+        for ordinal in 0..WARMUP_AUDIO_PACKETS {
+            let _payload_len = peer
+                .send_audio_packet(source.next_packet(PacketPhase::Warmup, ordinal))
+                .await?;
+            drain_pending(peer, ledger).await?;
+        }
+    }
+    if let Some(source) = media.video.as_mut() {
+        for frame in 0..WARMUP_VIDEO_FRAMES {
+            for packet in source.next_frame(PacketPhase::Warmup, frame) {
+                let _payload_len = peer.send_video_packet(packet).await?;
+                drain_pending(peer, ledger).await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn observe_send(

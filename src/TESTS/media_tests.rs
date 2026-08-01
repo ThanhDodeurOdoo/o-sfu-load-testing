@@ -91,7 +91,7 @@ fn mixed_sources_stagger_first_packets_within_one_interval() {
 
 #[test]
 fn mixed_source_deadlines_fit_the_requested_minute() {
-    let target = Duration::from_secs(60);
+    let target = Duration::from_mins(1);
     for rank in 0..10 {
         let mut timeline = MediaTimeline::staggered(AUDIO_FRAME_INTERVAL, rank, 10);
         let mut final_deadline = Duration::ZERO;

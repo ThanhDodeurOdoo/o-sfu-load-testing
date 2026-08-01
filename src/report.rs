@@ -140,7 +140,7 @@ pub fn render(inputs: &[PathBuf], artifact_url: Option<&str>) -> Result<String> 
     for input in inputs {
         match load_run(input) {
             Ok(run) => runs.push(run),
-            Err(error) => failures.push(load_failure(input, error)),
+            Err(error) => failures.push(load_failure(input, &error)),
         }
     }
     render_report(runs, failures, artifact_url)
@@ -187,7 +187,7 @@ pub(crate) fn load_run(input: &Path) -> Result<RunData> {
     })
 }
 
-pub(crate) fn load_failure(input: &Path, error: anyhow::Error) -> LoadFailure {
+pub(crate) fn load_failure(input: &Path, error: &anyhow::Error) -> LoadFailure {
     let mut failure = LoadFailure {
         source: input.display().to_string(),
         error: format!("{error:#}"),
@@ -2154,9 +2154,10 @@ fn pacing_label(result: &ScenarioResult) -> &'static str {
 
 pub(crate) fn pacing_valid(result: &ScenarioResult) -> bool {
     let interval_ms = match result.scenario {
-        ScenarioSpec::Smoke { .. } | ScenarioSpec::AudioMesh { .. } => 20,
+        ScenarioSpec::Smoke { .. }
+        | ScenarioSpec::AudioMesh { .. }
+        | ScenarioSpec::MixedConference { .. } => 20,
         ScenarioSpec::VideoGallery { .. } => 34,
-        ScenarioSpec::MixedConference { .. } => 20,
     };
     result.max_send_lag_ms <= interval_ms
 }
