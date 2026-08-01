@@ -16,22 +16,11 @@ use crate::{
 };
 
 const CATEGORY_CHART_POINTS: usize = 4;
-const CAPACITY_STATUS_FILE: &str = "capacity.status";
-const NIGHTLY_CAPACITY_SCENARIO: ScenarioSpec = ScenarioSpec::MixedConference {
-    rooms: 1,
-    peers: 100,
-    audio_publishers: 10,
-    video_publishers: 9,
-    seconds: 60,
-};
 const CPU_SMOOTHING_RADIUS: usize = 2;
 const CPU_TIMELINE_POINTS: usize = 32;
 const GITHUB_SUMMARY_LIMIT_BYTES: usize = 1024 * 1024;
-const INLINE_ERROR_LIMIT_CHARS: usize = 4 * 1024;
-const LOG_LIMIT_BYTES: u64 = 1024 * 1024;
 const RESULT_LIMIT_BYTES: u64 = 1024 * 1024;
 const SAMPLES_LIMIT_BYTES: u64 = 16 * 1024 * 1024;
-const STATUS_LIMIT_BYTES: u64 = 64;
 pub(crate) const MAX_INPUTS: usize = 256;
 pub(crate) const MAX_CHART_SCENARIOS: usize = 12;
 const MAX_TELEMETRY_SAMPLES: usize = 10_000;
@@ -44,24 +33,11 @@ pub(crate) struct RunData {
     pub(crate) source: String,
     pub(crate) result: ScenarioResult,
     pub(crate) samples: Option<SampleSet>,
-    pub(crate) capacity_process: Option<CapacityProcessStatus>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CapacityProcessStatus {
-    Passed,
-    Failed,
 }
 
 pub(crate) struct LoadFailure {
     pub(crate) source: String,
     pub(crate) error: String,
-    pub(crate) attempt: Option<FailedAttempt>,
-}
-
-pub(crate) struct FailedAttempt {
-    pub(crate) scenario: ScenarioSpec,
-    pub(crate) samples: Option<SampleSet>,
 }
 
 #[derive(Clone)]
@@ -82,8 +58,6 @@ struct TelemetrySample {
     rtc_rss_bytes: Option<u64>,
     server_cpu_percent_milli: Option<u64>,
     rtc_cpu_percent_milli: Option<u64>,
-    ingress_packets: Option<u64>,
-    ingress_payload_bytes: Option<u64>,
     forwarded_packets: Option<u64>,
     egress_payload_bytes: Option<u64>,
     packet_loop_delay_ms: Option<u64>,
@@ -140,7 +114,10 @@ pub fn render(inputs: &[PathBuf], artifact_url: Option<&str>) -> Result<String> 
     for input in inputs {
         match load_run(input) {
             Ok(run) => runs.push(run),
-            Err(error) => failures.push(load_failure(input, &error)),
+            Err(error) => failures.push(LoadFailure {
+                source: input.display().to_string(),
+                error: format!("{error:#}"),
+            }),
         }
     }
     render_report(runs, failures, artifact_url)
@@ -171,11 +148,6 @@ pub(crate) fn load_run(input: &Path) -> Result<RunData> {
     let payload = read_bounded(&result_path, RESULT_LIMIT_BYTES)?;
     let result = serde_json::from_slice::<ScenarioResult>(&payload)
         .with_context(|| format!("failed to decode {}", result_path.display()))?;
-    let capacity_process = if is_capacity_scenario(result.scenario) {
-        load_capacity_process(&result_path)?
-    } else {
-        None
-    };
     let samples_path = result_path.with_file_name("samples.jsonl");
     let samples = read_optional_bounded(&samples_path, SAMPLES_LIMIT_BYTES)?
         .map(|payload| parse_samples(&payload));
@@ -183,93 +155,7 @@ pub(crate) fn load_run(input: &Path) -> Result<RunData> {
         source: input.display().to_string(),
         result,
         samples,
-        capacity_process,
     })
-}
-
-pub(crate) fn load_failure(input: &Path, error: &anyhow::Error) -> LoadFailure {
-    let mut failure = LoadFailure {
-        source: input.display().to_string(),
-        error: format!("{error:#}"),
-        attempt: None,
-    };
-    let directory = if input.is_dir() {
-        input
-    } else if let Some(parent) = input.parent() {
-        parent
-    } else {
-        return failure;
-    };
-    let scenario = load_scenario(directory)
-        .ok()
-        .or_else(|| has_capacity_status(directory).then_some(NIGHTLY_CAPACITY_SCENARIO));
-    let Some(scenario) = scenario else {
-        return failure;
-    };
-    if !is_capacity_scenario(scenario) {
-        return failure;
-    }
-    let samples = read_optional_bounded(&directory.join("samples.jsonl"), SAMPLES_LIMIT_BYTES)
-        .ok()
-        .flatten()
-        .map(|payload| parse_samples(&payload));
-    if let Ok(Some(stderr)) =
-        read_optional_bounded(&directory.join("rtc.stderr.log"), LOG_LIMIT_BYTES)
-    {
-        let stderr = inline_diagnostic(&stderr);
-        if !stderr.is_empty() {
-            failure.error = stderr;
-        }
-    }
-    failure.attempt = Some(FailedAttempt { scenario, samples });
-    failure
-}
-
-fn has_capacity_status(directory: &Path) -> bool {
-    matches!(load_capacity_process(directory), Ok(Some(_)))
-}
-
-pub(crate) fn load_capacity_process(input: &Path) -> Result<Option<CapacityProcessStatus>> {
-    let path = if input.is_dir() {
-        input.join(CAPACITY_STATUS_FILE)
-    } else {
-        input.with_file_name(CAPACITY_STATUS_FILE)
-    };
-    read_optional_bounded(&path, STATUS_LIMIT_BYTES)?
-        .map(|status| match status.trim() {
-            "PASS" => Ok(CapacityProcessStatus::Passed),
-            "FAIL" => Ok(CapacityProcessStatus::Failed),
-            value => anyhow::bail!("capacity command wrote invalid status {value:?}"),
-        })
-        .transpose()
-}
-
-pub(crate) fn load_scenario(input: &Path) -> Result<ScenarioSpec> {
-    ensure!(input.is_dir(), "scenario input must be a directory");
-    let path = input.join("scenario.json");
-    let payload = read_bounded(&path, RESULT_LIMIT_BYTES)?;
-    let scenario = serde_json::from_slice::<ScenarioSpec>(&payload)
-        .with_context(|| format!("failed to decode {}", path.display()))?;
-    scenario.validate()?;
-    Ok(scenario)
-}
-
-fn inline_diagnostic(value: &str) -> String {
-    let collapsed = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.chars().count() <= INLINE_ERROR_LIMIT_CHARS {
-        return collapsed;
-    }
-    let side = INLINE_ERROR_LIMIT_CHARS / 2;
-    let start = collapsed.chars().take(side).collect::<String>();
-    let end = collapsed
-        .chars()
-        .rev()
-        .take(side)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<String>();
-    format!("{start} [raw RTC log truncated] {end}")
 }
 
 fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
@@ -384,16 +270,6 @@ impl TelemetrySample {
                 .or_else(|| value.get("rtcRssBytes").and_then(Value::as_u64)),
             server_cpu_percent_milli: value.get("serverCpuPercentMilli").and_then(Value::as_u64),
             rtc_cpu_percent_milli: value.get("rtcCpuPercentMilli").and_then(Value::as_u64),
-            ingress_packets: value
-                .get("traffic")
-                .and_then(|traffic| traffic.get("ingress"))
-                .and_then(|ingress| ingress.get("packets"))
-                .and_then(Value::as_u64),
-            ingress_payload_bytes: value
-                .get("traffic")
-                .and_then(|traffic| traffic.get("ingress"))
-                .and_then(|ingress| ingress.get("payloadBytes"))
-                .and_then(Value::as_u64),
             forwarded_packets: value
                 .get("traffic")
                 .and_then(|traffic| traffic.get("forwardedLocalRtc"))
@@ -427,8 +303,6 @@ impl TelemetrySample {
             || sample.rtc_rss_bytes.is_some()
             || sample.server_cpu_percent_milli.is_some()
             || sample.rtc_cpu_percent_milli.is_some()
-            || sample.ingress_packets.is_some()
-            || sample.ingress_payload_bytes.is_some()
             || sample.forwarded_packets.is_some()
             || sample.egress_payload_bytes.is_some()
             || sample.packet_loop_delay_ms.is_some()
@@ -631,19 +505,14 @@ fn render_report(
     } else {
         render_workloads(&mut output, &runs)?;
     }
-    if !runs.is_empty() || failures.iter().any(|failure| failure.attempt.is_some()) {
+    if !runs.is_empty() {
         render_media_profile(&mut output)?;
         render_scenario_legend(&mut output)?;
-    }
-    if !runs.is_empty() {
         render_delivery(&mut output, &runs)?;
         render_discrepancies(&mut output, &runs)?;
         if runs.iter().any(|run| run.samples.is_some()) {
             render_telemetry(&mut output, &runs)?;
         }
-    }
-    if failures.iter().any(|failure| failure.attempt.is_some()) {
-        render_failed_attempts(&mut output, "Incomplete capacity attempts", &failures)?;
     }
     ensure_summary_size(&output)?;
     Ok(output)
@@ -656,24 +525,17 @@ fn render_status(
     artifact_url: Option<&str>,
 ) -> Result<()> {
     let revision = revision_label(runs);
-    let telemetry = telemetry_status(runs, failures);
-    let scenarios = runs.len().saturating_add(
-        failures
-            .iter()
-            .filter(|failure| failure.attempt.is_some())
-            .count(),
-    );
+    let telemetry = telemetry_status(runs);
     writeln!(
         output,
-        "| Exact gates | Capacity target | Scenarios | Failed inputs | Telemetry | o-sfu revision |"
+        "| Exact work | Scenarios | Failed inputs | Telemetry | o-sfu revision |"
     )?;
-    writeln!(output, "| --- | --- | ---: | ---: | --- | --- |")?;
+    writeln!(output, "| --- | ---: | ---: | --- | --- |")?;
     writeln!(
         output,
-        "| {} | {} | {} | {} | {telemetry} | {} |\n",
-        exact_gate_status(runs, failures),
-        capacity_target_status(runs, failures),
-        scenarios,
+        "| {} | {} | {} | {telemetry} | {} |\n",
+        exact_status(runs, failures),
+        runs.len(),
         failures.len(),
         escape_table(&revision)
     )?;
@@ -682,277 +544,36 @@ fn render_status(
         "Completed performance samples: **{}**. A sample is invalid when send lag exceeds one media interval.\n",
         pacing_status(runs)
     )?;
-    if runs
-        .iter()
-        .any(|run| run.capacity_process == Some(CapacityProcessStatus::Failed))
-    {
-        writeln!(
-            output,
-            "The capacity process returned failure after writing a receiver ledger. The ledger remains visible for separate RTC validation while the capacity target remains **FAIL**.\n"
-        )?;
-    }
     if let Some(url) = artifact_url {
         writeln!(output, "[Download raw results and logs]({url})\n")?;
     }
     Ok(())
 }
 
-fn exact_gate_status(runs: &[RunData], failures: &[LoadFailure]) -> &'static str {
-    let has_exact_runs = runs
-        .iter()
-        .any(|run| !is_capacity_scenario(run.result.scenario));
-    let failed = failures.iter().any(|failure| failure.attempt.is_none());
-    if !has_exact_runs && !failed {
+fn exact_status(runs: &[RunData], failures: &[LoadFailure]) -> &'static str {
+    if runs.is_empty() && failures.is_empty() {
         "n/a"
-    } else if !failed
-        && runs
-            .iter()
-            .filter(|run| !is_capacity_scenario(run.result.scenario))
-            .all(run_passed)
-    {
+    } else if failures.is_empty() && runs.iter().all(run_passed) {
         "PASS"
     } else {
         "FAIL"
     }
 }
 
-fn capacity_target_status(runs: &[RunData], failures: &[LoadFailure]) -> &'static str {
-    if failures.iter().any(|failure| failure.attempt.is_some()) {
-        return "FAIL";
-    }
-    let completed = runs
-        .iter()
-        .any(|run| is_capacity_scenario(run.result.scenario));
-    if completed {
-        return if runs
-            .iter()
-            .filter(|run| is_capacity_scenario(run.result.scenario))
-            .all(|run| {
-                run_passed(run) && run.capacity_process != Some(CapacityProcessStatus::Failed)
-            }) {
-            "PASS"
-        } else {
-            "FAIL"
-        };
-    }
-    "n/a"
-}
-
 fn render_failures(output: &mut String, failures: &[LoadFailure]) -> Result<()> {
     writeln!(output, "## Input failures\n")?;
-    writeln!(output, "| Input | Scenario | Error |")?;
-    writeln!(output, "| --- | --- | --- |")?;
+    writeln!(output, "| Input | Error |")?;
+    writeln!(output, "| --- | --- |")?;
     for failure in failures {
         writeln!(
             output,
-            "| {} | {} | {} |",
+            "| {} | {} |",
             escape_table(&failure.source),
-            failure.attempt.as_ref().map_or_else(
-                || "n/a".to_owned(),
-                |attempt| scenario_label(attempt.scenario)
-            ),
             escape_table(&failure.error)
         )?;
     }
     writeln!(output)?;
     Ok(())
-}
-
-pub(crate) fn render_failed_attempts(
-    output: &mut String,
-    heading: &str,
-    failures: &[LoadFailure],
-) -> Result<()> {
-    let attempts = failures
-        .iter()
-        .filter_map(|failure| failure.attempt.as_ref().map(|attempt| (failure, attempt)))
-        .collect::<Vec<_>>();
-    writeln!(output, "## {heading}\n")?;
-    writeln!(
-        output,
-        "These mixed capacity inputs have no accepted receiver ledger. Their observed rates cover the first-to-last RTP counter increase, including deterministic warmup when it shares that envelope. Idle failure tails are excluded. The targets cover only the measured phase. SFU samples describe partial work rather than receiver-validated deliveries. CPU averages weight each process's available sample intervals independently. The CPU chart uses their common sample window.\n"
-    )?;
-    writeln!(
-        output,
-        "| Status | Scenario | Target ingress | Observed RTP envelope ingress | Target forwarding | Observed RTP envelope forwarding | SFU CPU avg / peak | RTC CPU avg | Loop heartbeat | Last RTP sample |"
-    )?;
-    writeln!(
-        output,
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
-    )?;
-    for (failure, attempt) in &attempts {
-        let plan = attempt.scenario.plan()?;
-        let duration_ms = planned_duration_ms(attempt.scenario);
-        let envelope = attempt.samples.as_ref().and_then(rtp_envelope_samples);
-        let summary = envelope
-            .as_ref()
-            .map_or_else(|| TelemetrySummary::from_samples(None, 0), capacity_summary);
-        let observed_ingress_packets = envelope.as_ref().and_then(|samples| {
-            counter_rate(&samples.samples, |sample| sample.ingress_packets, 1_000)
-        });
-        let observed_ingress_bits = envelope.as_ref().and_then(|samples| {
-            counter_rate(
-                &samples.samples,
-                |sample| sample.ingress_payload_bytes,
-                8_000,
-            )
-        });
-        writeln!(
-            output,
-            "| {} | {} | {} | {} | {} | {} | {} / {} | {} | {} | {} |",
-            capacity_status(failure, &summary),
-            scenario_label(attempt.scenario),
-            format_target_rate(
-                plan.offered_packets,
-                plan.offered_payload_bytes,
-                duration_ms
-            ),
-            format_observed_rate(observed_ingress_packets, observed_ingress_bits),
-            format_target_rate(
-                plan.expected_deliveries,
-                plan.expected_delivery_payload_bytes,
-                duration_ms
-            ),
-            format_observed_rate(
-                envelope.as_ref().and_then(|samples| counter_rate(
-                    &samples.samples,
-                    |sample| sample.forwarded_packets,
-                    1_000,
-                )),
-                envelope.as_ref().and_then(|samples| counter_rate(
-                    &samples.samples,
-                    |sample| sample.egress_payload_bytes,
-                    8_000,
-                )),
-            ),
-            format_optional(summary.server_cpu_percent_milli, format_cpu_percent),
-            format_optional(summary.server_cpu_peak_percent_milli, format_cpu_percent),
-            format_optional(summary.rtc_cpu_percent_milli, format_cpu_percent),
-            format_packet_loop_health(&summary),
-            envelope
-                .as_ref()
-                .and_then(|samples| samples.samples.last())
-                .map_or_else(
-                    || "n/a".to_owned(),
-                    |sample| { format_milliseconds(sample.elapsed_ms) }
-                )
-        )?;
-    }
-    writeln!(output)?;
-    for (failure, attempt) in attempts {
-        let Some(samples) = attempt.samples.as_ref().and_then(rtp_envelope_samples) else {
-            continue;
-        };
-        render_capacity_charts(output, failure, attempt, &samples)?;
-    }
-    Ok(())
-}
-
-fn capacity_status(failure: &LoadFailure, summary: &TelemetrySummary) -> String {
-    let mut labels = Vec::new();
-    if summary
-        .server_cpu_percent_milli
-        .is_some_and(|average| average >= 95_000)
-    {
-        labels.push("SFU CPU AVG >=95%");
-    } else if summary
-        .server_cpu_peak_percent_milli
-        .is_some_and(|peak| peak >= 95_000)
-    {
-        labels.push("SFU CPU PEAK >=95%");
-    }
-    if summary.packet_loop_unresponsive_samples > 0 {
-        labels.push("UNRESPONSIVE");
-    }
-    if failure.error.to_ascii_lowercase().contains("disconnected") {
-        labels.push("DISCONNECTED");
-    }
-    if labels.is_empty() {
-        labels.push("FAILED");
-    }
-    labels.join(" / ")
-}
-
-fn rtp_envelope_samples(sample_set: &SampleSet) -> Option<SampleSet> {
-    let increased = |window: &[TelemetrySample]| {
-        let [previous, current] = window else {
-            return false;
-        };
-        counter_increased(previous, current, |sample| sample.ingress_packets)
-            || counter_increased(previous, current, |sample| sample.forwarded_packets)
-    };
-    let start = sample_set.samples.windows(2).position(increased)?;
-    let end = sample_set
-        .samples
-        .windows(2)
-        .rposition(increased)?
-        .saturating_add(2);
-    Some(SampleSet {
-        samples: sample_set.samples.get(start..end)?.to_vec(),
-        unavailable: sample_set.unavailable,
-        errors: sample_set.errors.clone(),
-    })
-}
-
-fn capacity_summary(envelope: &SampleSet) -> TelemetrySummary {
-    let mut summary = TelemetrySummary::from_samples(Some(envelope), 0);
-    let interval_samples = envelope.samples.get(1..).unwrap_or_default();
-    summary.server_cpu_peak_percent_milli = interval_samples
-        .iter()
-        .filter_map(|sample| sample.server_cpu_percent_milli)
-        .max();
-    summary.packet_loop_delay_ms = interval_samples
-        .iter()
-        .filter_map(|sample| sample.packet_loop_delay_ms)
-        .max();
-    summary.packet_loop_unresponsive_samples = interval_samples
-        .iter()
-        .filter(|sample| sample.packet_loop_unresponsive)
-        .count();
-    summary
-}
-
-fn counter_increased(
-    previous: &TelemetrySample,
-    current: &TelemetrySample,
-    value: fn(&TelemetrySample) -> Option<u64>,
-) -> bool {
-    matches!((value(previous), value(current)), (Some(previous), Some(current)) if current > previous)
-}
-
-fn format_target_rate(packets: u64, payload_bytes: u64, duration_ms: u64) -> String {
-    format!(
-        "{} packets/s / {}",
-        format_count_rate(packets, duration_ms),
-        format_bits_per_second(payload_bits_per_second(payload_bytes, duration_ms))
-    )
-}
-
-fn format_observed_rate(packets: Option<u64>, bits: Option<u64>) -> String {
-    match (packets, bits) {
-        (Some(packets), Some(bits)) => format!(
-            "{} packets/s / {}",
-            grouped(packets),
-            format_bits_per_second(bits)
-        ),
-        _ => "n/a".to_owned(),
-    }
-}
-
-fn format_count_rate(count: u64, duration_ms: u64) -> String {
-    if duration_ms == 0 {
-        return "n/a".to_owned();
-    }
-    let tenths = u128::from(count) * 10_000 / u128::from(duration_ms);
-    if tenths.is_multiple_of(10) {
-        grouped(u64::try_from(tenths / 10).unwrap_or(u64::MAX))
-    } else {
-        format!(
-            "{}.{:01}",
-            grouped(u64::try_from(tenths / 10).unwrap_or(u64::MAX)),
-            tenths % 10
-        )
-    }
 }
 
 fn format_packet_loop_health(summary: &TelemetrySummary) -> String {
@@ -969,223 +590,6 @@ fn format_packet_loop_health(summary: &TelemetrySummary) -> String {
         "UNRESPONSIVE ({} {unit}, numeric max {numeric})",
         summary.packet_loop_unresponsive_samples,
     )
-}
-
-fn render_capacity_charts(
-    output: &mut String,
-    failure: &LoadFailure,
-    attempt: &FailedAttempt,
-    samples: &SampleSet,
-) -> Result<()> {
-    let scenario = scenario_label(attempt.scenario);
-    writeln!(output, "### Capacity telemetry: {scenario}\n")?;
-    writeln!(
-        output,
-        "Outcome: **{}**. Raw one-second samples and process logs remain in the workflow artifact.\n",
-        capacity_status(failure, &capacity_summary(samples))
-    )?;
-    render_capacity_cpu_chart(output, &scenario, samples)?;
-    let plan = attempt.scenario.plan()?;
-    let duration_ms = planned_duration_ms(attempt.scenario);
-    render_capacity_forwarding_chart(output, &scenario, samples, &plan, duration_ms)?;
-    render_capacity_payload_chart(output, &scenario, samples, &plan, duration_ms)
-}
-
-fn render_capacity_cpu_chart(
-    output: &mut String,
-    scenario: &str,
-    samples: &SampleSet,
-) -> Result<()> {
-    let cpu_points = samples
-        .samples
-        .iter()
-        .skip(1)
-        .filter_map(|sample| {
-            Some((
-                sample.elapsed_ms,
-                sample.server_cpu_percent_milli?,
-                sample.rtc_cpu_percent_milli?,
-            ))
-        })
-        .collect::<Vec<_>>();
-    let baseline_ms = samples.samples.first().map(|sample| sample.elapsed_ms);
-    let server_cpu = interval_series(
-        &cpu_points
-            .iter()
-            .map(|(elapsed_ms, server, _rtc)| (*elapsed_ms, *server))
-            .collect::<Vec<_>>(),
-        baseline_ms,
-    );
-    let rtc_cpu = interval_series(
-        &cpu_points
-            .iter()
-            .map(|(elapsed_ms, _server, rtc)| (*elapsed_ms, *rtc))
-            .collect::<Vec<_>>(),
-        baseline_ms,
-    );
-    if server_cpu.values.len() == rtc_cpu.values.len()
-        && server_cpu.elapsed_ms == rtc_cpu.elapsed_ms
-        && !server_cpu.values.is_empty()
-    {
-        let server_values = smooth_units(&server_cpu.values, 1_000);
-        let rtc_values = smooth_units(&rtc_cpu.values, 1_000);
-        render_timeline_chart(
-            output,
-            &format!("Process CPU during {scenario}"),
-            "The lines are centered five-bucket moving averages over the common SFU and RTC process-sample window inside the RTP envelope. They can end before the counter graphs when the RTC generator exits before the final scrape. One hundred percent is one logical CPU.",
-            server_cpu.elapsed_ms.div_ceil(1_000).max(1),
-            "CPU (%)",
-            100,
-            &[
-                ChartSeries {
-                    name: "SFU process",
-                    values: &server_values,
-                },
-                ChartSeries {
-                    name: "RTC generator",
-                    values: &rtc_values,
-                },
-            ],
-        )?;
-    }
-    Ok(())
-}
-
-fn render_capacity_forwarding_chart(
-    output: &mut String,
-    scenario: &str,
-    samples: &SampleSet,
-    plan: &crate::WorkloadPlan,
-    duration_ms: u64,
-) -> Result<()> {
-    let forwarding =
-        counter_rate_timeline(&samples.samples, |sample| sample.forwarded_packets, 1_000);
-    if !forwarding.values.is_empty() {
-        let observed = moving_average(&forwarding.values, CPU_SMOOTHING_RADIUS);
-        let target_value = rate_value(plan.expected_deliveries, duration_ms, 1_000);
-        let target = vec![target_value; observed.len()];
-        render_timeline_chart(
-            output,
-            &format!("SFU forwarding during {scenario}"),
-            "The observed line is a centered five-bucket moving average of SFU forwarding-counter deltas. The target line is the fixed receiver-route workload. These are SFU observations because the exact receiver ledger did not finish.",
-            forwarding.elapsed_ms.div_ceil(1_000).max(1),
-            "RTP packets/s",
-            0,
-            &[
-                ChartSeries {
-                    name: "SFU observed",
-                    values: &observed,
-                },
-                ChartSeries {
-                    name: "fixed target",
-                    values: &target,
-                },
-            ],
-        )?;
-    }
-    Ok(())
-}
-
-fn render_capacity_payload_chart(
-    output: &mut String,
-    scenario: &str,
-    samples: &SampleSet,
-    plan: &crate::WorkloadPlan,
-    duration_ms: u64,
-) -> Result<()> {
-    let payload = counter_rate_timeline(
-        &samples.samples,
-        |sample| sample.egress_payload_bytes,
-        8_000,
-    );
-    if !payload.values.is_empty() {
-        let observed = smooth_units(&payload.values, 1_000_000);
-        let target_value = rounded_div(
-            payload_bits_per_second(plan.expected_delivery_payload_bytes, duration_ms),
-            1_000_000,
-        );
-        let target = vec![target_value; observed.len()];
-        render_timeline_chart(
-            output,
-            &format!("SFU RTP payload egress during {scenario}"),
-            "The observed line is a centered five-bucket moving average of SFU egress RTP payload-counter deltas. Header, encryption and network overhead remain excluded.",
-            payload.elapsed_ms.div_ceil(1_000).max(1),
-            "RTP payload Mbit/s",
-            0,
-            &[
-                ChartSeries {
-                    name: "SFU observed",
-                    values: &observed,
-                },
-                ChartSeries {
-                    name: "fixed target",
-                    values: &target,
-                },
-            ],
-        )?;
-    }
-    Ok(())
-}
-
-fn counter_rate_timeline(
-    samples: &[TelemetrySample],
-    value: fn(&TelemetrySample) -> Option<u64>,
-    scale: u64,
-) -> Timeline {
-    interval_series(
-        &counter_rate_points(samples, value, scale),
-        samples.first().map(|sample| sample.elapsed_ms),
-    )
-}
-
-fn interval_series(points: &[(u64, u64)], baseline_ms: Option<u64>) -> Timeline {
-    let Some((first_ms, first_value)) = points.first().copied() else {
-        return point_series(points);
-    };
-    let Some(baseline_ms) = baseline_ms.filter(|baseline_ms| *baseline_ms < first_ms) else {
-        return point_series(points);
-    };
-    let mut extended = Vec::with_capacity(points.len().saturating_add(1));
-    extended.push((baseline_ms, first_value));
-    extended.extend_from_slice(points);
-    point_series(&extended)
-}
-
-fn counter_rate_points(
-    samples: &[TelemetrySample],
-    value: fn(&TelemetrySample) -> Option<u64>,
-    scale: u64,
-) -> Vec<(u64, u64)> {
-    samples
-        .windows(2)
-        .filter_map(|window| {
-            let [previous, current] = window else {
-                return None;
-            };
-            let elapsed_ms = current.elapsed_ms.checked_sub(previous.elapsed_ms)?;
-            let delta = value(current)?.checked_sub(value(previous)?)?;
-            (elapsed_ms > 0).then(|| {
-                let rate = u128::from(delta) * u128::from(scale) / u128::from(elapsed_ms);
-                (current.elapsed_ms, u64::try_from(rate).unwrap_or(u64::MAX))
-            })
-        })
-        .collect()
-}
-
-fn smooth_units(values: &[u64], divisor: u64) -> Vec<u64> {
-    moving_average(values, CPU_SMOOTHING_RADIUS)
-        .into_iter()
-        .map(|value| rounded_div(value, divisor))
-        .collect()
-}
-
-fn rate_value(count: u64, duration_ms: u64, scale: u64) -> u64 {
-    if duration_ms == 0 {
-        return 0;
-    }
-    let numerator = u128::from(count) * u128::from(scale);
-    let value = (numerator + u128::from(duration_ms) / 2) / u128::from(duration_ms);
-    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 fn render_workloads(output: &mut String, runs: &[RunData]) -> Result<()> {
@@ -1341,7 +745,7 @@ pub(crate) fn render_scenario_legend(output: &mut String) -> Result<()> {
     )?;
     writeln!(
         output,
-        "- `mixed-conference-1x100-10a-9v-60s` or `M 1x100/10a/9v/60s` means 1 room with 100 peers. 10 publish audio and the first 9 of those also publish video for 60 seconds.\n"
+        "- `mixed-conference-1x20-5a-4v-10s` or `M 1x20/5a/4v/10s` means 1 room with 20 peers. 5 publish audio and the first 4 of those also publish video for 10 seconds.\n"
     )?;
     Ok(())
 }
@@ -2066,19 +1470,6 @@ fn run_passed(run: &RunData) -> bool {
     validate_run(run).is_ok()
 }
 
-pub(crate) const fn is_capacity_scenario(scenario: ScenarioSpec) -> bool {
-    matches!(
-        scenario,
-        ScenarioSpec::MixedConference {
-            rooms: 1,
-            peers: 100,
-            audio_publishers: 10,
-            video_publishers: 9,
-            seconds: 60,
-        }
-    )
-}
-
 pub(crate) fn validate_run(run: &RunData) -> Result<()> {
     run.result.validate(run.result.scenario)
 }
@@ -2090,22 +1481,14 @@ fn validation_label(run: &RunData) -> String {
     )
 }
 
-fn telemetry_status(runs: &[RunData], failures: &[LoadFailure]) -> &'static str {
-    let failure_samples = failures
-        .iter()
-        .filter_map(|failure| failure.attempt.as_ref())
-        .map(|attempt| attempt.samples.as_ref());
-    if runs.iter().all(|run| run.samples.is_none())
-        && failure_samples.clone().all(|samples| samples.is_none())
-    {
+fn telemetry_status(runs: &[RunData]) -> &'static str {
+    if runs.iter().all(|run| run.samples.is_none()) {
         return "n/a";
     }
     if runs.iter().any(|run| {
         run.samples
             .as_ref()
             .is_none_or(|samples| samples.samples.is_empty() || samples.unavailable > 0)
-    }) || failure_samples.into_iter().any(|samples| {
-        samples.is_none_or(|samples| samples.samples.is_empty() || samples.unavailable > 0)
     }) {
         return "INCOMPLETE";
     }
@@ -2117,17 +1500,7 @@ fn telemetry_status(runs: &[RunData], failures: &[LoadFailure]) -> &'static str 
                 .any(|sample| sample.packet_loop_unresponsive)
         })
     });
-    let failure_unresponsive = failures.iter().any(|failure| {
-        failure.attempt.as_ref().is_some_and(|attempt| {
-            attempt.samples.as_ref().is_some_and(|samples| {
-                samples
-                    .samples
-                    .iter()
-                    .any(|sample| sample.packet_loop_unresponsive)
-            })
-        })
-    });
-    if run_unresponsive || failure_unresponsive {
+    if run_unresponsive {
         "UNHEALTHY"
     } else {
         "COMPLETE"

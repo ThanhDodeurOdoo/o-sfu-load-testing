@@ -104,16 +104,16 @@ fn mixed_media_turns_follow_staggered_source_deadlines() {
 fn mixed_expectations_exclude_self_from_both_media_kinds() -> anyhow::Result<()> {
     let (low_packets, high_packets) = video_packets_per_layer(1)?;
 
-    let dual_publisher = expected_audio_streams(0, 100, 10, 0, 50)?.len()
-        + expected_video_streams(0, 100, 9, 0, low_packets, high_packets)?.len();
-    let audio_publisher = expected_audio_streams(0, 100, 10, 9, 50)?.len()
-        + expected_video_streams(0, 100, 9, 9, low_packets, high_packets)?.len();
-    let receiver = expected_audio_streams(0, 100, 10, 99, 50)?.len()
-        + expected_video_streams(0, 100, 9, 99, low_packets, high_packets)?.len();
+    let dual_publisher = expected_audio_streams(0, 20, 5, 0, 50)?.len()
+        + expected_video_streams(0, 20, 4, 0, low_packets, high_packets)?.len();
+    let audio_publisher = expected_audio_streams(0, 20, 5, 4, 50)?.len()
+        + expected_video_streams(0, 20, 4, 4, low_packets, high_packets)?.len();
+    let receiver = expected_audio_streams(0, 20, 5, 19, 50)?.len()
+        + expected_video_streams(0, 20, 4, 19, low_packets, high_packets)?.len();
 
-    assert_eq!(dual_publisher, 17);
-    assert_eq!(audio_publisher, 18);
-    assert_eq!(receiver, 19);
+    assert_eq!(dual_publisher, 7);
+    assert_eq!(audio_publisher, 8);
+    assert_eq!(receiver, 9);
     Ok(())
 }
 

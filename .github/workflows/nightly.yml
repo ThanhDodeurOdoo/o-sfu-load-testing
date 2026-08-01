@@ -232,47 +232,9 @@ jobs:
 
           exit "$status"
 
-      - name: Run 100-person capacity target
-        id: capacity-target
-        continue-on-error: true
-        env:
-          MODE: ${{ steps.revisions.outputs.mode }}
-        run: |
-          status=0
-
-          run_capacity_target() {
-            local target_directory=$1
-            local output=$2
-            mkdir -p "$output" || return 1
-            if ! "$target_directory/release/o-sfu-load" \
-              --server-binary "$target_directory/release/o-sfu-load-server" \
-              --rtc-binary "$target_directory/release/o-sfu-load-rtc" \
-              --server-cpus 0 \
-              --rtc-cpus 1-3 \
-              --output "$output" \
-              mixed-conference --rooms 1 --peers 100 \
-                --audio-publishers 10 --video-publishers 9 --seconds 60; then
-              status=1
-              echo FAIL > "$output/capacity.status" || status=1
-            else
-              echo PASS > "$output/capacity.status" || status=1
-            fi
-          }
-
-          if [[ "$MODE" == single ]]; then
-            run_capacity_target target artifacts/mixed-1x100
-          else
-            echo "The capacity target is omitted from exact revision comparisons."
-          fi
-
-          exit "$status"
-
       - name: Prepare CPU profiler
         id: profiler
-        if: >-
-          ${{ !cancelled() &&
-              (steps.capacity-target.outcome == 'success' ||
-               steps.capacity-target.outcome == 'failure') }}
+        if: success()
         run: |
           set -uo pipefail
           mkdir -p artifacts
@@ -435,8 +397,6 @@ jobs:
             cp "$profile_directory/release/o-sfu-load-server" \
               "$output/o-sfu-load-server" || return 1
             cp "$lock" "$output/Cargo.lock" || return 1
-            local load_status=0
-            local prepare_status=0
             "$run_directory/release/o-sfu-load" \
               --server-binary "$profile_directory/release/o-sfu-load-server" \
               --rtc-binary "$run_directory/release/o-sfu-load-rtc" \
@@ -444,28 +404,9 @@ jobs:
               --rtc-cpus 1-3 \
               --profile-server \
               --output "$output" \
-              mixed-conference --rooms 1 --peers 100 \
-                --audio-publishers 10 --video-publishers 9 \
-                --seconds 60 || load_status=$?
-            if (( load_status == 0 )); then
-              echo PASS > "$output/capacity.status" || return 1
-            else
-              echo FAIL > "$output/capacity.status" || return 1
-            fi
-            if (( load_status == 0 )) || [[ -s "$output/perf.data" ]]; then
-              "$run_directory/release/o-sfu-load-profile" \
-                prepare --input "$output" || prepare_status=$?
-            fi
-            if [[ -s "$output/profile.ready" ]]; then
-              return 0
-            fi
-            if (( prepare_status != 0 )); then
-              return "$prepare_status"
-            fi
-            if (( load_status != 0 )); then
-              return "$load_status"
-            fi
-            return 1
+              audio-mesh --rooms 1 --peers 28 --seconds 120 || return 1
+            "$run_directory/release/o-sfu-load-profile" \
+              prepare --input "$output" || return 1
           }
 
           capture_with_log() {
@@ -498,27 +439,27 @@ jobs:
 
           if [[ "$MODE" == single ]]; then
             capture_with_log target target/profile \
-              artifacts/profile/mixed-1x100 Cargo.lock || status=1
-            if [[ -s artifacts/profile/mixed-1x100/profile.ready ]]; then
+              artifacts/profile/audio-1x28 Cargo.lock || status=1
+            if [[ -s artifacts/profile/audio-1x28/profile.ready ]]; then
               render_preview \
-                artifacts/profile/mixed-1x100/flamegraph.svg \
+                artifacts/profile/audio-1x28/flamegraph.svg \
                 artifacts/o-sfu-flamegraph.png || status=1
             fi
           else
             capture_with_log target/baseline target/profile-baseline \
-              artifacts/profile/baseline/mixed-1x100 \
+              artifacts/profile/baseline/audio-1x28 \
               artifacts/baseline/Cargo.lock || status=1
             capture_with_log target/comparison target/profile-comparison \
-              artifacts/profile/comparison/mixed-1x100 \
+              artifacts/profile/comparison/audio-1x28 \
               artifacts/comparison/Cargo.lock || status=1
-            if [[ -s artifacts/profile/baseline/mixed-1x100/profile.ready ]]; then
+            if [[ -s artifacts/profile/baseline/audio-1x28/profile.ready ]]; then
               render_preview \
-                artifacts/profile/baseline/mixed-1x100/flamegraph.svg \
+                artifacts/profile/baseline/audio-1x28/flamegraph.svg \
                 artifacts/o-sfu-flamegraph-baseline.png || status=1
             fi
-            if [[ -s artifacts/profile/comparison/mixed-1x100/profile.ready ]]; then
+            if [[ -s artifacts/profile/comparison/audio-1x28/profile.ready ]]; then
               render_preview \
-                artifacts/profile/comparison/mixed-1x100/flamegraph.svg \
+                artifacts/profile/comparison/audio-1x28/flamegraph.svg \
                 artifacts/o-sfu-flamegraph-comparison.png || status=1
             fi
           fi
@@ -576,7 +517,6 @@ jobs:
                 --input artifacts/audio-1x28
                 --input artifacts/video-1x12
                 --input artifacts/video-1x64
-                --input artifacts/mixed-1x100
                 --output "$summary"
               )
             fi
@@ -683,20 +623,20 @@ jobs:
             } >> "$publication"
             publish_profile \
               target/baseline/release/o-sfu-load-profile \
-              artifacts/profile/baseline/mixed-1x100 \
+              artifacts/profile/baseline/audio-1x28 \
               '## Baseline revision' \
               artifacts/profile-baseline-summary.md \
               "$baseline_url"
             publish_profile \
               target/comparison/release/o-sfu-load-profile \
-              artifacts/profile/comparison/mixed-1x100 \
+              artifacts/profile/comparison/audio-1x28 \
               '## Comparison revision' \
               artifacts/profile-comparison-summary.md \
               "$comparison_url"
           else
             publish_profile \
               target/release/o-sfu-load-profile \
-              artifacts/profile/mixed-1x100 \
+              artifacts/profile/audio-1x28 \
               '# o-sfu CPU profile' \
               artifacts/profile-summary.md \
               "$single_url"

@@ -67,14 +67,12 @@ pub async fn run(config: RunConfig) -> Result<ScenarioResult> {
     let samples_path = config.output_directory.join("samples.jsonl");
     let rtc_stdout_path = config.output_directory.join("rtc.stdout.log");
     let rtc_stderr_path = config.output_directory.join("rtc.stderr.log");
-    let capacity_status_path = config.output_directory.join("capacity.status");
     for path in [
         &result_path,
         &spec_path,
         &samples_path,
         &rtc_stdout_path,
         &rtc_stderr_path,
-        &capacity_status_path,
     ] {
         remove_stale_artifact(path).await?;
     }

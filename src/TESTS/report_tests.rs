@@ -1,13 +1,12 @@
-use std::{env, fs, path::PathBuf, process, slice::from_ref};
+use std::{env, fs, path::PathBuf, process};
 
 use serde_json::json;
 
 use super::{
-    ChartSeries, FailedAttempt, GITHUB_SUMMARY_LIMIT_BYTES, LoadFailure, RunData, SampleSet,
-    TelemetrySummary, chart_axis_max, cpu_micros_per_million, cpu_series, delivery_rate,
-    ensure_summary_size, escape_table, format_mebibytes, is_capacity_scenario, moving_average,
-    parse_samples, render_category_charts, render_report, validate_artifact_url,
-    validate_flamegraph_url,
+    ChartSeries, GITHUB_SUMMARY_LIMIT_BYTES, LoadFailure, RunData, SampleSet, TelemetrySummary,
+    chart_axis_max, cpu_micros_per_million, cpu_series, delivery_rate, ensure_summary_size,
+    escape_table, format_mebibytes, moving_average, parse_samples, render_category_charts,
+    render_report, validate_artifact_url, validate_flamegraph_url,
 };
 use crate::{ScenarioResult, ScenarioSpec};
 
@@ -44,7 +43,7 @@ fn report_sorts_workloads_and_renders_visual_rates() -> anyhow::Result<()> {
 
 #[test]
 fn report_describes_mixed_conference_and_exact_media_units() -> anyhow::Result<()> {
-    let mixed = run(ScenarioSpec::mixed_conference(1, 100, 10, 9, 60)?, None, 0)?;
+    let mixed = run(ScenarioSpec::mixed_conference(1, 20, 5, 4, 10)?, None, 0)?;
 
     let report = render_runs(vec![mixed], None)?;
 
@@ -64,111 +63,9 @@ fn report_describes_mixed_conference_and_exact_media_units() -> anyhow::Result<(
         "| One VP8 camera publication, two RTP streams | 2-second GOP | 453.5 | 3,868,800 bit/s |"
     ));
     assert!(report.contains(
-        "| PASS | mixed-conference-1x100-10a-9v-60s | 1 | 100 | 10 audio / 9 video | 28 | 1,881 | 274,890 | 6,955,530 | 60 s |"
+        "| PASS | mixed-conference-1x20-5a-4v-10s | 1 | 20 | 5 audio / 4 video | 13 | 171 | 20,640 | 149,180 | 10 s |"
     ));
-    assert!(report.contains("`M 1x100/10a/9v/60s`"));
-    Ok(())
-}
-
-#[test]
-fn only_the_designated_mixed_workload_is_a_capacity_target() -> anyhow::Result<()> {
-    assert!(is_capacity_scenario(ScenarioSpec::mixed_conference(
-        1, 100, 10, 9, 60
-    )?));
-    assert!(!is_capacity_scenario(ScenarioSpec::mixed_conference(
-        1, 20, 5, 4, 10
-    )?));
-    Ok(())
-}
-
-#[test]
-fn capacity_command_failure_overrides_a_complete_result() -> anyhow::Result<()> {
-    let directory = test_directory("capacity-status");
-    fs::create_dir_all(&directory)?;
-    let scenario = ScenarioSpec::mixed_conference(1, 100, 10, 9, 60)?;
-    let completed = run(scenario, None, 0)?;
-    fs::write(
-        directory.join("result.json"),
-        serde_json::to_vec(&completed.result)?,
-    )?;
-    fs::write(
-        directory.join("scenario.json"),
-        serde_json::to_vec(&scenario)?,
-    )?;
-    fs::write(directory.join("capacity.status"), "FAIL\n")?;
-
-    let result_path = directory.join("result.json");
-    let report = super::render(from_ref(&result_path), None)?;
-
-    assert!(report.contains("| n/a | FAIL | 1 | 0 |"));
-    assert!(
-        report.contains("The capacity process returned failure after writing a receiver ledger.")
-    );
-    assert!(!report.contains("## Input failures"));
-
-    fs::write(directory.join("capacity.status"), "INVALID\n")?;
-    let rejected = super::render(from_ref(&result_path), None)?;
-    assert!(rejected.contains("## Incomplete capacity attempts"));
-    assert!(rejected.contains("mixed-conference-1x100-10a-9v-60s"));
-    assert!(rejected.contains("capacity command wrote invalid status"));
-    fs::remove_dir_all(directory)?;
-    Ok(())
-}
-
-#[test]
-fn capacity_marker_classifies_failure_without_scenario_metadata() -> anyhow::Result<()> {
-    let directory = test_directory("capacity-before-scenario");
-    fs::create_dir_all(&directory)?;
-    fs::write(directory.join("capacity.status"), "FAIL\n")?;
-
-    let report = super::render(from_ref(&directory), None)?;
-
-    assert!(report.contains("| n/a | FAIL | 1 | 1 |"));
-    assert!(report.contains("## Incomplete capacity attempts"));
-    assert!(report.contains("mixed-conference-1x100-10a-9v-60s"));
-    fs::remove_dir_all(directory)?;
-    Ok(())
-}
-
-#[test]
-fn failed_capacity_attempt_keeps_target_and_sampled_graphs() -> anyhow::Result<()> {
-    let scenario = ScenarioSpec::mixed_conference(1, 100, 10, 9, 60)?;
-    let samples = parse_samples(
-        r#"
-{"elapsedMs":0,"serverCpuPercentMilli":0,"rtcCpuPercentMilli":0,"traffic":{"ingress":{"packets":0,"payloadBytes":0},"forwardedLocalRtc":{"packets":0},"egress":{"payloadBytes":0}}}
-{"elapsedMs":1000,"serverCpuPercentMilli":100000,"rtcCpuPercentMilli":105000,"traffic":{"ingress":{"packets":0,"payloadBytes":0},"forwardedLocalRtc":{"packets":0},"egress":{"payloadBytes":0}},"workers":[{"packetLoopDelayMs":0}]}
-{"elapsedMs":2000,"serverCpuPercentMilli":100000,"rtcCpuPercentMilli":105000,"traffic":{"ingress":{"packets":1000,"payloadBytes":1000000},"forwardedLocalRtc":{"packets":30000},"egress":{"payloadBytes":20000000}},"workers":[{"packetLoopDelayMs":84}]}
-{"elapsedMs":3000,"serverCpuPercentMilli":100000,"rtcCpuPercentMilli":105000,"traffic":{"ingress":{"packets":2400,"payloadBytes":2200000},"forwardedLocalRtc":{"packets":65000},"egress":{"payloadBytes":40000000}},"workers":[{"packetLoopDelayMs":null}]}
-"#,
-    );
-    let report = render_report(
-        Vec::new(),
-        vec![LoadFailure {
-            source: "artifacts/mixed-1x100".to_owned(),
-            error: "RTC connection disconnected".to_owned(),
-            attempt: Some(FailedAttempt {
-                scenario,
-                samples: Some(samples),
-            }),
-        }],
-        None,
-    )?;
-
-    assert!(report.contains("| n/a | FAIL | 1 | 1 | UNHEALTHY | n/a |"));
-    assert!(report.contains("## Per-stream media load"));
-    assert!(report.contains("## Incomplete capacity attempts"));
-    assert!(report.contains(
-        "| SFU CPU AVG >=95% / UNRESPONSIVE / DISCONNECTED | mixed-conference-1x100-10a-9v-60s |"
-    ));
-    assert!(report.contains("4,581.5 packets/s / 35.1 Mbit/s"));
-    assert!(report.contains("1,200 packets/s / 8.8 Mbit/s"));
-    assert!(report.contains("115,925.5 packets/s / 519.7 Mbit/s"));
-    assert!(report.contains("32,500 packets/s / 160.0 Mbit/s"));
-    assert!(report.contains("UNRESPONSIVE (1 sample, numeric max 84 ms)"));
-    assert!(report.contains("title \"Process CPU during mixed-conference-1x100-10a-9v-60s\""));
-    assert!(report.contains("title \"SFU forwarding during mixed-conference-1x100-10a-9v-60s\""));
-    assert!(report.contains("x-axis \"elapsed (s)\" 0 --> 2"));
-    assert!(report.contains("line [31666, 31666, 31666]"));
+    assert!(report.contains("`M 1x20/5a/4v/10s`"));
     Ok(())
 }
 
@@ -196,7 +93,7 @@ fn report_marks_delivery_discrepancies_and_send_lag() -> anyhow::Result<()> {
 
     let report = render_runs(vec![failed], None)?;
 
-    assert!(report.contains("| FAIL | n/a | 1 | 0 | n/a | deadbeef |"));
+    assert!(report.contains("| FAIL | 1 | 0 | n/a | deadbeef |"));
     assert!(report.contains("Completed performance samples: **INVALID**"));
     assert!(report.contains("| 37 ms |"));
     assert!(report.contains(
@@ -214,12 +111,11 @@ fn malformed_input_does_not_hide_valid_results() -> anyhow::Result<()> {
         vec![LoadFailure {
             source: "bad|input".to_owned(),
             error: "invalid [result](https://example.com)".to_owned(),
-            attempt: None,
         }],
         None,
     )?;
 
-    assert!(report.contains("| FAIL | n/a | 1 | 1 | n/a | deadbeef |"));
+    assert!(report.contains("| FAIL | 1 | 1 | n/a | deadbeef |"));
     assert!(report.contains("## Input failures"));
     assert!(report.contains("bad&#124;input"));
     assert!(report.contains("&#91;result&#93;&#40;https://example.com&#41;"));
@@ -234,12 +130,11 @@ fn report_survives_when_every_input_fails() -> anyhow::Result<()> {
         vec![LoadFailure {
             source: "missing/result.json".to_owned(),
             error: "file is missing".to_owned(),
-            attempt: None,
         }],
         None,
     )?;
 
-    assert!(report.contains("| FAIL | n/a | 0 | 1 | n/a | n/a |"));
+    assert!(report.contains("| FAIL | 0 | 1 | n/a | n/a |"));
     assert!(report.contains("No valid result files were available."));
     Ok(())
 }
@@ -658,7 +553,6 @@ fn run(
         source: "fixture".to_owned(),
         result,
         samples: None,
-        capacity_process: None,
     })
 }
 

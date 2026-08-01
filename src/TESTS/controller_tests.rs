@@ -5,8 +5,8 @@ use crate::ScenarioSpec;
 
 #[test]
 fn mixed_deadline_tracks_sequential_publication_rounds() -> anyhow::Result<()> {
-    let spec = ScenarioSpec::mixed_conference(1, 100, 10, 9, 60)?;
+    let spec = ScenarioSpec::mixed_conference(1, 20, 5, 4, 10)?;
 
-    assert_eq!(rtc_worker_deadline(spec), Duration::from_secs(500));
+    assert_eq!(rtc_worker_deadline(spec), Duration::from_secs(250));
     Ok(())
 }

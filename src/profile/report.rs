@@ -16,13 +16,9 @@ use super::{
     CAPTURE_FILE, ENVIRONMENT_FILE, FLAMEGRAPH_FILE, FOLDED_FILE, PERF_DATA_FILE,
     PROFILE_READY_FILE, capture::CaptureMetadata,
 };
-use crate::{
-    O_SFU_REVISION, ScenarioSpec,
-    report::{
-        CapacityProcessStatus, ensure_summary_size, escape_table, load_capacity_process, load_run,
-        load_scenario, scenario_label, validate_artifact_url, validate_flamegraph_url,
-        validate_run,
-    },
+use crate::report::{
+    RunData, ensure_summary_size, escape_table, load_run, scenario_label, validate_artifact_url,
+    validate_flamegraph_url, validate_run,
 };
 
 const CAPTURE_LIMIT_BYTES: u64 = 64 * 1024;
@@ -78,10 +74,7 @@ struct EnvironmentMetadata {
 }
 
 struct PreparedProfile {
-    scenario: ScenarioSpec,
-    revision: Option<String>,
-    exact: bool,
-    capacity_process: Option<CapacityProcessStatus>,
+    run: RunData,
     capture: CaptureMetadata,
     environment: EnvironmentMetadata,
     profile: FoldedProfile,
@@ -100,6 +93,7 @@ pub fn prepare(input: &Path) -> Result<()> {
     let perf_data = input.join(PERF_DATA_FILE);
     ensure_nonempty(&perf_data)?;
     load_capture(input)?;
+    validate_run(&load_run(input)?)?;
     let perf_script = input.join("perf.script");
     run_perf(
         &["script", "--fields", "sw:-period", "--input"],
@@ -243,7 +237,8 @@ fn load_prepared(input: &Path) -> Result<PreparedProfile> {
     ] {
         ensure_nonempty(&input.join(name))?;
     }
-    let (scenario, revision, exact, capacity_process) = load_profile_run(input)?;
+    let run = load_run(input)?;
+    validate_run(&run)?;
     let capture = load_capture(input)?;
     let environment_payload = read_limited(&input.join(ENVIRONMENT_FILE), CAPTURE_LIMIT_BYTES)?;
     let environment = serde_json::from_str::<EnvironmentMetadata>(&environment_payload)
@@ -259,10 +254,7 @@ fn load_prepared(input: &Path) -> Result<PreparedProfile> {
         "profile contains no valid samples"
     );
     Ok(PreparedProfile {
-        scenario,
-        revision,
-        exact,
-        capacity_process,
+        run,
         capture,
         environment,
         profile,
@@ -278,38 +270,6 @@ fn load_capture(input: &Path) -> Result<CaptureMetadata> {
         "unsupported profile metadata schema"
     );
     Ok(capture)
-}
-
-fn load_profile_run(
-    input: &Path,
-) -> Result<(
-    ScenarioSpec,
-    Option<String>,
-    bool,
-    Option<CapacityProcessStatus>,
-)> {
-    match load_run(input) {
-        Ok(run) => {
-            let exact = validate_run(&run).is_ok();
-            Ok((
-                run.result.scenario,
-                run.result.o_sfu_revision,
-                exact,
-                run.capacity_process,
-            ))
-        }
-        Err(error) => {
-            let scenario =
-                load_scenario(input).with_context(|| format!("failed result: {error:#}"))?;
-            let capacity_process = load_capacity_process(input)?;
-            Ok((
-                scenario,
-                Some(O_SFU_REVISION.to_owned()),
-                false,
-                capacity_process,
-            ))
-        }
-    }
 }
 
 /// Renders the CPU profile summary from one prepared profile directory.
@@ -343,28 +303,22 @@ fn render_overview(
     writeln!(output, "# o-sfu CPU profile\n")?;
     writeln!(
         output,
-        "| Profile | Capacity process | Exact RTC work | Scenario | o-sfu revision | Event | Unwind | Requested frequency | Capture | Samples | Unresolved leaf |"
+        "| Profile | Exact RTC work | Scenario | o-sfu revision | Event | Unwind | Requested frequency | Capture | Samples | Unresolved leaf |"
     )?;
     writeln!(
         output,
-        "| --- | --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: |"
+        "| --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: |"
     )?;
     writeln!(
         output,
-        "| {} | {} | {} | {} | {} | {} | {} | {} Hz | {} | {} | {} |\n",
+        "| {} | PASS | {} | {} | {} | {} | {} Hz | {} | {} | {} |\n",
         if report.profile.malformed_lines == 0 {
             "AVAILABLE"
         } else {
             "INCOMPLETE"
         },
-        match report.capacity_process {
-            Some(CapacityProcessStatus::Passed) => "PASS",
-            Some(CapacityProcessStatus::Failed) => "FAIL",
-            None => "n/a",
-        },
-        if report.exact { "PASS" } else { "FAIL" },
-        scenario_label(report.scenario),
-        escape_table(report.revision.as_deref().unwrap_or("n/a")),
+        scenario_label(report.run.result.scenario),
+        escape_table(report.run.result.o_sfu_revision.as_deref().unwrap_or("n/a")),
         escape_table(&report.capture.event),
         escape_table(&report.capture.call_graph),
         report.capture.frequency_hz,
@@ -377,19 +331,8 @@ fn render_overview(
     )?;
     writeln!(
         output,
-        "Capacity process covers controller, profiling and shutdown completion. Exact RTC work validates the receiver ledger independently.\n"
+        "This is a dedicated qualitative replay built with frame pointers. Sampling starts after server readiness and covers peer setup, warmup, measured traffic and drain. Sampling overhead does not affect the authoritative nightly measurements.\n"
     )?;
-    if report.exact {
-        writeln!(
-            output,
-            "This is a dedicated qualitative replay built with frame pointers. Sampling starts after server readiness and covers peer setup, warmup, measured traffic and drain. Sampling overhead does not affect the authoritative nightly measurements.\n"
-        )?;
-    } else {
-        writeln!(
-            output,
-            "This is a dedicated qualitative replay built with frame pointers. Sampling starts after server readiness and ends when the failed replay stops. It can cover any prefix of peer setup, warmup, measured traffic and drain. Sampling overhead does not affect the ordinary nightly measurements.\n"
-        )?;
-    }
     writeln!(
         output,
         "Flamegraph width represents sample share and horizontal position is not time. Stack depth grows vertically.\n"
@@ -659,12 +602,12 @@ fn collapse_stacks(input: &Path, perf_script: &Path, folded: &Path) -> Result<()
 }
 
 fn render_flamegraph(input: &Path, folded: &Path) -> Result<()> {
-    let (scenario, revision, _exact, _capacity_process) = load_profile_run(input)?;
-    let title = format!("o-sfu CPU: {}", scenario_label(scenario));
+    let run = load_run(input)?;
+    let title = format!("o-sfu CPU: {}", scenario_label(run.result.scenario));
     let subtitle = format!(
         "requested {} Hz cpu-clock, o-sfu {}",
         super::FREQUENCY_HZ,
-        revision.as_deref().unwrap_or("unknown")
+        run.result.o_sfu_revision.as_deref().unwrap_or("unknown")
     );
     let output = input.join(FLAMEGRAPH_FILE);
     let mut command = Command::new("inferno-flamegraph");

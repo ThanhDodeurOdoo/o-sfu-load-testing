@@ -38,37 +38,37 @@ fn video_plan_counts_featured_and_thumbnail_layers() -> anyhow::Result<()> {
 
 #[test]
 fn mixed_conference_plan_counts_overlapping_publishers() -> anyhow::Result<()> {
-    let spec = ScenarioSpec::mixed_conference(1, 100, 10, 9, 60)?;
+    let spec = ScenarioSpec::mixed_conference(1, 20, 5, 4, 10)?;
     let plan = spec.plan()?;
 
-    assert_eq!(plan.streams, 28);
-    assert_eq!(plan.routes, 1_881);
-    assert_eq!(plan.offered_packets, 274_890);
-    assert_eq!(plan.offered_payload_bytes, 263_544_000);
-    assert_eq!(plan.expected_deliveries, 6_955_530);
-    assert_eq!(plan.expected_delivery_payload_bytes, 3_897_918_000);
-    assert_eq!(spec.audio_publishers_per_room(), 10);
-    assert_eq!(spec.video_publishers_per_room(), 9);
+    assert_eq!(plan.streams, 13);
+    assert_eq!(plan.routes, 171);
+    assert_eq!(plan.offered_packets, 20_640);
+    assert_eq!(plan.offered_payload_bytes, 19_544_000);
+    assert_eq!(plan.expected_deliveries, 149_180);
+    assert_eq!(plan.expected_delivery_payload_bytes, 107_108_000);
+    assert_eq!(spec.audio_publishers_per_room(), 5);
+    assert_eq!(spec.video_publishers_per_room(), 4);
     assert_eq!(
         ServerPolicy::for_scenario(spec).max_active_audio_speakers,
-        10
+        5
     );
     Ok(())
 }
 
 #[test]
 fn mixed_conference_serializes_camel_case_coordinates() -> anyhow::Result<()> {
-    let spec = ScenarioSpec::mixed_conference(1, 100, 10, 9, 60)?;
+    let spec = ScenarioSpec::mixed_conference(1, 20, 5, 4, 10)?;
 
     assert_eq!(
         serde_json::to_value(spec)?,
         json!({
             "type": "mixed-conference",
             "rooms": 1,
-            "peers": 100,
-            "audioPublishers": 10,
-            "videoPublishers": 9,
-            "seconds": 60,
+            "peers": 20,
+            "audioPublishers": 5,
+            "videoPublishers": 4,
+            "seconds": 10,
         })
     );
     Ok(())
@@ -104,8 +104,8 @@ fn scenarios_reject_empty_or_unbounded_work() {
     assert!(ScenarioSpec::audio_mesh(65, 2, 1).is_err());
     assert!(ScenarioSpec::audio_mesh(1, 101, 1).is_err());
     assert!(ScenarioSpec::video_gallery(1, 3, 11, 1).is_err());
-    assert!(ScenarioSpec::mixed_conference(1, 100, 8, 9, 60).is_err());
-    assert!(ScenarioSpec::mixed_conference(1, 100, 10, 11, 60).is_err());
+    assert!(ScenarioSpec::mixed_conference(1, 20, 8, 9, 60).is_err());
+    assert!(ScenarioSpec::mixed_conference(1, 20, 11, 11, 60).is_err());
 }
 
 #[test]

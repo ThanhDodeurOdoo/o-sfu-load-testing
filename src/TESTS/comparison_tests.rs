@@ -40,15 +40,15 @@ fn comparison_renders_revision_lines_and_deltas() -> anyhow::Result<()> {
 
 #[test]
 fn comparison_pairs_mixed_conference_contracts() -> anyhow::Result<()> {
-    let spec = ScenarioSpec::mixed_conference(1, 100, 10, 9, 60)?;
-    let baseline = run(spec, BASELINE_REVISION, 60_000, 0)?;
-    let comparison = run(spec, COMPARISON_REVISION, 60_000, 0)?;
+    let spec = ScenarioSpec::mixed_conference(1, 20, 5, 4, 10)?;
+    let baseline = run(spec, BASELINE_REVISION, 10_000, 0)?;
+    let comparison = run(spec, COMPARISON_REVISION, 10_000, 0)?;
 
     let report = render_runs(vec![baseline], vec![comparison])?;
 
     assert!(report.contains("| PASS | IDENTICAL | VALID | INVALID | 1 | 0 |"));
     assert!(report.contains(
-        "| mixed-conference-1x100-10a-9v-60s | opus-vp8-mixed-conference-v1 | 6,955,530 | 60 s |"
+        "| mixed-conference-1x20-5a-4v-10s | opus-vp8-mixed-conference-v1 | 149,180 | 10 s |"
     ));
     assert!(report.contains("## Per-stream media load"));
     Ok(())
@@ -235,7 +235,6 @@ fn run(
         source: revision.to_owned(),
         result,
         samples: None,
-        capacity_process: None,
     })
 }
 
