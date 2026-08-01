@@ -235,6 +235,7 @@ fn run(
         source: revision.to_owned(),
         result,
         samples: None,
+        capacity_process: None,
     })
 }
 

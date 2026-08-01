@@ -3,8 +3,8 @@ use std::{collections::BTreeMap, env, fs, path::PathBuf, process};
 use serde_json::json;
 
 use super::{
-    FoldedProfile, display_stack, format_percent, informative_inclusive_frame, ranked,
-    render_ranked,
+    CapacityProcessStatus, FoldedProfile, display_stack, format_percent,
+    informative_inclusive_frame, load_profile_run, ranked, render_ranked,
 };
 
 #[test]
@@ -108,10 +108,31 @@ fn inclusive_summary_omits_uninformative_roots() {
 }
 
 #[test]
+fn failed_profile_run_keeps_scenario_context() -> anyhow::Result<()> {
+    let directory = test_directory("failed-run");
+    fs::create_dir_all(&directory)?;
+    let scenario = crate::ScenarioSpec::mixed_conference(1, 100, 10, 9, 60)?;
+    fs::write(
+        directory.join("scenario.json"),
+        serde_json::to_vec(&scenario)?,
+    )?;
+    fs::write(directory.join("capacity.status"), "FAIL\n")?;
+
+    let (loaded, revision, exact, capacity_process) = load_profile_run(&directory)?;
+
+    assert_eq!(loaded, scenario);
+    assert_eq!(revision.as_deref(), Some(crate::O_SFU_REVISION));
+    assert!(!exact);
+    assert_eq!(capacity_process, Some(CapacityProcessStatus::Failed));
+    fs::remove_dir_all(directory)?;
+    Ok(())
+}
+
+#[test]
 fn profile_summary_explains_overlapping_costs_and_raw_evidence() -> anyhow::Result<()> {
     let directory = test_directory("summary");
     fs::create_dir_all(&directory)?;
-    let scenario = crate::ScenarioSpec::smoke(1, 50)?;
+    let scenario = crate::ScenarioSpec::mixed_conference(1, 100, 10, 9, 60)?;
     let plan = scenario.plan()?;
     let result = json!({
         "schemaVersion": 4,
@@ -143,6 +164,7 @@ fn profile_summary_explains_overlapping_costs_and_raw_evidence() -> anyhow::Resu
         "maxSendLagMs": 0
     });
     fs::write(directory.join("result.json"), serde_json::to_vec(&result)?)?;
+    fs::write(directory.join("capacity.status"), "FAIL\n")?;
     fs::write(
         directory.join(super::CAPTURE_FILE),
         serde_json::to_vec(&json!({
@@ -187,7 +209,7 @@ fn profile_summary_explains_overlapping_costs_and_raw_evidence() -> anyhow::Resu
     let flamegraph_url = "https://github.com/example/repo/releases/download/load-test-assets/o-sfu-flamegraph-1-1.png";
     let summary = super::render(&directory, Some(artifact_url), Some(flamegraph_url))?;
 
-    assert!(summary.contains("| AVAILABLE | PASS | smoke-1r-50p |"));
+    assert!(summary.contains("| AVAILABLE | FAIL | PASS | mixed-conference-1x100-10a-9v-60s |"));
     assert!(summary.contains("| cpu-clock | fp | 99 Hz | 2.500 s | 100 | 10 (10.00%) |"));
     assert!(summary.contains("| CPU model | Example CPU |"));
     assert!(summary.contains("| Maximum stack depth | 127 |"));

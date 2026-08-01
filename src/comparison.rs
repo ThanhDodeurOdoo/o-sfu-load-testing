@@ -117,6 +117,7 @@ fn load_side(inputs: &[PathBuf]) -> Side {
             Err(error) => failures.push(LoadFailure {
                 source: input.display().to_string(),
                 error: format!("{error:#}"),
+                attempt: None,
             }),
         }
     }

@@ -65,7 +65,19 @@ pub async fn run(config: RunConfig) -> Result<ScenarioResult> {
     let result_path = config.output_directory.join("result.json");
     let spec_path = config.output_directory.join("scenario.json");
     let samples_path = config.output_directory.join("samples.jsonl");
-    remove_stale_result(&result_path).await?;
+    let rtc_stdout_path = config.output_directory.join("rtc.stdout.log");
+    let rtc_stderr_path = config.output_directory.join("rtc.stderr.log");
+    let capacity_status_path = config.output_directory.join("capacity.status");
+    for path in [
+        &result_path,
+        &spec_path,
+        &samples_path,
+        &rtc_stdout_path,
+        &rtc_stderr_path,
+        &capacity_status_path,
+    ] {
+        remove_stale_artifact(path).await?;
+    }
     let encoded_spec = serde_json::to_vec_pretty(&config.spec)
         .context("failed to encode the scenario specification")?;
     fs::write(&spec_path, encoded_spec)
@@ -374,11 +386,13 @@ async fn stop_rtc_worker(rtc: &mut Child) -> Result<()> {
     Ok(())
 }
 
-async fn remove_stale_result(result_path: &Path) -> Result<()> {
-    match fs::remove_file(result_path).await {
+async fn remove_stale_artifact(path: &Path) -> Result<()> {
+    match fs::remove_file(path).await {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).context("failed to remove stale result.json"),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to remove stale {}", path.display()))
+        }
     }
 }
 

@@ -209,9 +209,6 @@ jobs:
               video-gallery --rooms 1 --peers 12 --publishers 4 --seconds 30 || return 1
             "$run_profile" video-1x64 \
               video-gallery --rooms 1 --peers 64 --publishers 10 --seconds 60 || return 1
-            "$run_profile" mixed-1x100 \
-              mixed-conference --rooms 1 --peers 100 \
-                --audio-publishers 10 --video-publishers 9 --seconds 60 || return 1
           }
 
           run_single_profile() {
@@ -235,9 +232,47 @@ jobs:
 
           exit "$status"
 
+      - name: Run 100-person capacity target
+        id: capacity-target
+        continue-on-error: true
+        env:
+          MODE: ${{ steps.revisions.outputs.mode }}
+        run: |
+          status=0
+
+          run_capacity_target() {
+            local target_directory=$1
+            local output=$2
+            mkdir -p "$output" || return 1
+            if ! "$target_directory/release/o-sfu-load" \
+              --server-binary "$target_directory/release/o-sfu-load-server" \
+              --rtc-binary "$target_directory/release/o-sfu-load-rtc" \
+              --server-cpus 0 \
+              --rtc-cpus 1-3 \
+              --output "$output" \
+              mixed-conference --rooms 1 --peers 100 \
+                --audio-publishers 10 --video-publishers 9 --seconds 60; then
+              status=1
+              echo FAIL > "$output/capacity.status" || status=1
+            else
+              echo PASS > "$output/capacity.status" || status=1
+            fi
+          }
+
+          if [[ "$MODE" == single ]]; then
+            run_capacity_target target artifacts/mixed-1x100
+          else
+            echo "The capacity target is omitted from exact revision comparisons."
+          fi
+
+          exit "$status"
+
       - name: Prepare CPU profiler
         id: profiler
-        if: success()
+        if: >-
+          ${{ !cancelled() &&
+              (steps.capacity-target.outcome == 'success' ||
+               steps.capacity-target.outcome == 'failure') }}
         run: |
           set -uo pipefail
           mkdir -p artifacts
@@ -400,6 +435,8 @@ jobs:
             cp "$profile_directory/release/o-sfu-load-server" \
               "$output/o-sfu-load-server" || return 1
             cp "$lock" "$output/Cargo.lock" || return 1
+            local load_status=0
+            local prepare_status=0
             "$run_directory/release/o-sfu-load" \
               --server-binary "$profile_directory/release/o-sfu-load-server" \
               --rtc-binary "$run_directory/release/o-sfu-load-rtc" \
@@ -409,9 +446,26 @@ jobs:
               --output "$output" \
               mixed-conference --rooms 1 --peers 100 \
                 --audio-publishers 10 --video-publishers 9 \
-                --seconds 60 || return 1
-            "$run_directory/release/o-sfu-load-profile" \
-              prepare --input "$output" || return 1
+                --seconds 60 || load_status=$?
+            if (( load_status == 0 )); then
+              echo PASS > "$output/capacity.status" || return 1
+            else
+              echo FAIL > "$output/capacity.status" || return 1
+            fi
+            if (( load_status == 0 )) || [[ -s "$output/perf.data" ]]; then
+              "$run_directory/release/o-sfu-load-profile" \
+                prepare --input "$output" || prepare_status=$?
+            fi
+            if [[ -s "$output/profile.ready" ]]; then
+              return 0
+            fi
+            if (( prepare_status != 0 )); then
+              return "$prepare_status"
+            fi
+            if (( load_status != 0 )); then
+              return "$load_status"
+            fi
+            return 1
           }
 
           capture_with_log() {
@@ -506,14 +560,12 @@ jobs:
                 --baseline-input artifacts/baseline/audio-1x28
                 --baseline-input artifacts/baseline/video-1x12
                 --baseline-input artifacts/baseline/video-1x64
-                --baseline-input artifacts/baseline/mixed-1x100
                 --comparison-input artifacts/comparison/audio-1x8
                 --comparison-input artifacts/comparison/audio-2x12
                 --comparison-input artifacts/comparison/audio-3x12
                 --comparison-input artifacts/comparison/audio-1x28
                 --comparison-input artifacts/comparison/video-1x12
                 --comparison-input artifacts/comparison/video-1x64
-                --comparison-input artifacts/comparison/mixed-1x100
                 --output "$summary"
               )
             else

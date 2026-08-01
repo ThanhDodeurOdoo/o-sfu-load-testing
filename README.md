@@ -56,8 +56,12 @@ and [4 Mbit/s high RID](https://github.com/ThanhDodeurOdoo/o-sfu/blob/9cae4cbaa1
 defaults. The high RID is a production near-cap stress profile rather than an
 ordinary camera average. The fixed GOP adds conservative keyframe pressure.
 Both RIDs use VP8 payload descriptors, PictureID, TL0PICIDX and marker
-semantics. Payload bodies carry deterministic identities rather than decodable
-video.
+semantics. [RFC 7741](https://www.rfc-editor.org/rfc/rfc7741.html#section-4.4)
+defines VP8 frame fragmentation across RTP packets. The largest 1,100 B RTP
+payload leaves 180 B for IPv6, UDP, RTP, SRTP and negotiated extensions beneath
+the 1,280 B IPv6 effective MTU discussed by
+[RFC 8085](https://www.rfc-editor.org/rfc/rfc8085.html#section-3.2). Payload
+bodies carry deterministic identities rather than decodable video.
 
 Every rate above is RTP payload only. It excludes RTP headers, SRTP, UDP, IP,
 RTCP and retransmissions. WebRTC similarly defines `maxBitrate` without IP or
@@ -158,8 +162,9 @@ per room and a 60 second workload.
 
 ## CPU profiling
 
-The nightly workflow replays the 100-peer mixed conference after the ordinary
-measurements. Linux `perf` samples only the o-sfu process with the software
+The nightly workflow replays the 100-peer mixed capacity target after the
+ordinary measurements even when that target saturates or disconnects. Linux
+`perf` samples only the o-sfu process with the software
 `cpu-clock` event at a requested 99 Hz. The profiling server is rebuilt with
 debug information and forced frame pointers. The RTC generator remains a
 separate process on CPUs 1 through 3.
@@ -195,25 +200,31 @@ revisions after their ordinary scenarios have completed.
 CI runs the bounded smoke. The nightly workflow runs these fixed profiles
 using four assigned logical CPUs:
 
-| Profile | Publications/room | Consumers/source | Deliveries/s | Exact deliveries |
-| --- | ---: | ---: | ---: | ---: |
-| 1 room × 8 audio peers × 30 s | 8 | 7 | 2,800 | 84,000 |
-| 2 rooms × 12 audio peers × 60 s | 12 | 11 | 13,200 | 792,000 |
-| 3 rooms × 12 audio peers × 120 s | 12 | 11 | 19,800 | 2,376,000 |
-| 1 room × 28 audio peers × 120 s | 28 | 27 | 37,800 | 4,536,000 |
-| 1 room × 12 peers × 4 cameras × 30 s | 4 | 11 | 6,052 | 181,560 |
-| 1 room × 64 peers × 10 cameras × 60 s | 10 | 63 | 44,335 | 2,660,100 |
-| 1 room × 100 peers × 10 audio + 9 cameras × 60 s | 10 audio + 9 video | 99 | 115,925.5 | 6,955,530 |
+| Profile | Role | Publications/room | Consumers/source | Deliveries/s | Exact deliveries |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 1 room × 8 audio peers × 30 s | Exact gate | 8 | 7 | 2,800 | 84,000 |
+| 2 rooms × 12 audio peers × 60 s | Exact gate | 12 | 11 | 13,200 | 792,000 |
+| 3 rooms × 12 audio peers × 120 s | Exact gate | 12 | 11 | 19,800 | 2,376,000 |
+| 1 room × 28 audio peers × 120 s | Exact gate | 28 | 27 | 37,800 | 4,536,000 |
+| 1 room × 12 peers × 4 cameras × 30 s | Exact gate | 4 | 11 | 6,052 | 181,560 |
+| 1 room × 64 peers × 10 cameras × 60 s | Exact gate | 10 | 63 | 44,335 | 2,660,100 |
+| 1 room × 100 peers × 10 audio + 9 cameras × 60 s | Capacity target | 10 audio + 9 video | 99 | 115,925.5 | 6,955,530 |
 
 The 28-peer audio room exercises 756 simultaneous source-to-receiver routes.
 The 64-peer video room exercises 10 simulcast publishers and 630 selected
-source-to-receiver routes. The 100-peer mixed conference uses 10 audio
+source-to-receiver routes. The 100-peer mixed capacity target uses 10 audio
 publishers. The first 9 also publish both VP8 RIDs. It exercises 28 incoming RTP
 streams, 1,881 selected routes, 4,581.5 incoming packets/s and 115,925.5
 forwarded packets/s. That is 35.1392 Mbit/s of incoming RTP payload and 519.7224
-Mbit/s of forwarded RTP payload. The nightly run requires 17,585,190 exact
-forwarded deliveries. Its job summary renders the graphs directly without
-requiring an artifact download. Artifacts retain the detailed evidence.
+Mbit/s of forwarded RTP payload. The six deterministic profiles gate
+10,629,660 exact forwarded deliveries. The mixed target attempts another
+6,955,530 deliveries as a non-blocking capacity probe. A failed target remains
+visible with planned-versus-observed graphs, telemetry and logs.
+For an incomplete attempt, observed rates cover the first-to-last RTP counter
+increase and can include the deterministic warmup. They exclude an idle failure
+tail and are never labelled as receiver-validated delivery.
+Its job summary renders the graphs directly without requiring an artifact
+download. Artifacts retain the detailed evidence.
 
 Scheduled runs and manual runs without comparison inputs keep the ordinary
 single-version behavior. A manual comparison accepts `comparison_revision` as
@@ -227,7 +238,9 @@ target directories. The fixed scenario suite then runs sequentially on the
 same `ubuntu-24.04` virtual machine. Both revisions assign the SFU to CPU 0 and
 the RTC generator to CPUs 1 through 3. Each baseline scenario runs immediately
 before its matching comparison scenario. Comparison artifacts retain both
-result trees plus both lock files.
+result trees plus both lock files. Exact revision comparisons omit the capacity
+target because a runner ceiling is not deterministic. Their qualitative
+profiler still replays the 100-peer mixed workload for each revision.
 
 Comparison graphs cover receiver deliveries, receiver-observed RTP payload,
 SFU CPU time per million deliveries, generator send lag, packet-loop delay,
