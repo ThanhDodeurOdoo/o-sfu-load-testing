@@ -1,5 +1,3 @@
-use std::{env, fs, path::PathBuf, process};
-
 use serde_json::json;
 
 use super::{
@@ -63,7 +61,7 @@ fn report_describes_mixed_conference_and_exact_media_units() -> anyhow::Result<(
         "| One VP8 camera publication, two RTP streams | 2-second GOP | 453.5 | 3,868,800 bit/s |"
     ));
     assert!(report.contains("| Streams | Total media consumers | Offered packets |"));
-    assert!(report.contains("10 × (60 - 1) = 590"));
+    assert!(report.contains("10 \u{d7} (60 - 1) = 590"));
     assert!(report.contains(
         "| PASS | mixed-conference-1x20-5a-4v-10s | 1 | 20 | 5 audio / 4 video | 13 | 171 | 20,640 | 149,180 | 10 s |"
     ));
@@ -571,12 +569,4 @@ impl RunTestExt for RunData {
 
 fn render_runs(runs: Vec<RunData>, artifact_url: Option<&str>) -> anyhow::Result<String> {
     render_report(runs, Vec::new(), artifact_url)
-}
-
-fn test_directory(label: &str) -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    env::temp_dir().join(format!("o-sfu-load-{label}-{}-{id}", process::id()))
 }

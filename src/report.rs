@@ -636,7 +636,7 @@ pub(crate) fn render_consumer_context(output: &mut String) -> Result<()> {
     )?;
     writeln!(
         output,
-        "For example, 10 audio publishers among 60 total peers create `10 × (60 - 1) = 590` consumers. The count would be 600 only for 60 listeners separate from the 10 publishers. [mediasoup documents](https://mediasoup.org/documentation/v3/scalability/) that one single-core worker typically handles over roughly 500 consumers depending on host CPU capability. That figure is topology context, not a portable capacity threshold.\n"
+        "For example, 10 audio publishers among 60 total peers create `10 \u{d7} (60 - 1) = 590` consumers. The count would be 600 only for 60 listeners separate from the 10 publishers. [mediasoup documents](https://mediasoup.org/documentation/v3/scalability/) that one single-core worker typically handles over roughly 500 consumers depending on host CPU capability. That figure is topology context, not a portable capacity threshold.\n"
     )?;
     Ok(())
 }
