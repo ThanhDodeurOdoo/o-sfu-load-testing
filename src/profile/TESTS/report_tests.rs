@@ -2,7 +2,10 @@ use std::{collections::BTreeMap, env, fs, path::PathBuf, process};
 
 use serde_json::json;
 
-use super::{FoldedProfile, format_percent, ranked, render_ranked};
+use super::{
+    FoldedProfile, display_stack, format_percent, informative_inclusive_frame, ranked,
+    render_ranked,
+};
 
 #[test]
 fn folded_profile_aggregates_self_inclusive_thread_and_kernel_samples() -> anyhow::Result<()> {
@@ -15,8 +18,18 @@ fn folded_profile_aggregates_self_inclusive_thread_and_kernel_samples() -> anyho
     assert_eq!(profile.inclusive_samples.get("route"), Some(&70));
     assert_eq!(profile.thread_samples.get("rtc-loop/1"), Some(&70));
     assert_eq!(profile.kernel_samples, 20);
-    assert_eq!(profile.unresolved_samples, 30);
+    assert_eq!(profile.unresolved_leaf_samples, 30);
+    assert_eq!(profile.unresolved_stack_samples, 30);
     assert_eq!(profile.stack_samples.len(), 3);
+    Ok(())
+}
+
+#[test]
+fn unresolved_roots_do_not_hide_resolved_leaf_cost() -> anyhow::Result<()> {
+    let profile = FoldedProfile::parse("rtc-loop/1;[libc.so.6 <7f00>];send 10\n")?;
+
+    assert_eq!(profile.unresolved_leaf_samples, 0);
+    assert_eq!(profile.unresolved_stack_samples, 10);
     Ok(())
 }
 
@@ -68,6 +81,30 @@ fn partition_breakdown_retains_the_omitted_share() -> anyhow::Result<()> {
 
     assert!(output.contains("| Other | Remaining entries | 1 | 6.25% |"));
     Ok(())
+}
+
+#[test]
+fn displayed_stacks_keep_the_thread_and_leaf_side() {
+    let (thread, stack) = display_stack(
+        "rtc-loop/1;very-long-runtime-root;packet-loop;source-policy;hot-leaf",
+        40,
+    );
+
+    assert_eq!(thread, "rtc-loop/1");
+    assert!(stack.starts_with("... -> "));
+    assert!(stack.ends_with("source-policy -> hot-leaf"));
+    assert!(!stack.contains("very-long-runtime-root"));
+}
+
+#[test]
+fn inclusive_summary_omits_uninformative_roots() {
+    assert!(!informative_inclusive_frame("[libc.so.6 <7f00>]"));
+    assert!(!informative_inclusive_frame(
+        "<std::sys::thread::unix::Thread>::new::thread_start"
+    ));
+    assert!(informative_inclusive_frame(
+        "o_sfu_core::packet_loop::PacketLoopTurn::pump"
+    ));
 }
 
 #[test]
@@ -155,6 +192,8 @@ fn profile_summary_explains_overlapping_costs_and_raw_evidence() -> anyhow::Resu
     assert!(summary.contains("| CPU model | Example CPU |"));
     assert!(summary.contains("| Maximum stack depth | 127 |"));
     assert!(summary.contains("| Kernel | 30 | 30.00% |"));
+    assert!(summary.contains("| Unresolved leaf | 10 | 10.00% |"));
+    assert!(summary.contains("| Partially symbolized stack | 10 | 10.00% |"));
     assert!(summary.contains("Self cost attributes each sample to its leaf frame"));
     assert!(summary.contains("Inclusive cost counts a frame once"));
     assert!(summary.contains(&format!(

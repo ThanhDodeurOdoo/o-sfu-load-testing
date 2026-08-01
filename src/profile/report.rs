@@ -53,7 +53,8 @@ struct FoldedProfile {
     inclusive_samples: BTreeMap<String, u64>,
     thread_samples: BTreeMap<String, u64>,
     kernel_samples: u64,
-    unresolved_samples: u64,
+    unresolved_leaf_samples: u64,
+    unresolved_stack_samples: u64,
     malformed_lines: usize,
     diagnostics: Vec<String>,
 }
@@ -294,7 +295,7 @@ fn render_overview(
     writeln!(output, "# o-sfu CPU profile\n")?;
     writeln!(
         output,
-        "| Profile | Exact RTC work | Scenario | o-sfu revision | Event | Unwind | Requested frequency | Capture | Samples | Unresolved |"
+        "| Profile | Exact RTC work | Scenario | o-sfu revision | Event | Unwind | Requested frequency | Capture | Samples | Unresolved leaf |"
     )?;
     writeln!(
         output,
@@ -321,7 +322,7 @@ fn render_overview(
         format_duration(report.capture.duration_ms),
         grouped(report.profile.total_samples),
         format_count_percent(
-            report.profile.unresolved_samples,
+            report.profile.unresolved_leaf_samples,
             report.profile.total_samples
         )
     )?;
@@ -397,13 +398,19 @@ fn render_breakdown(output: &mut String, profile: &FoldedProfile) -> Result<()> 
     )?;
     render_count_row(
         output,
-        "Contains an unresolved frame",
-        profile.unresolved_samples,
+        "Unresolved leaf",
+        profile.unresolved_leaf_samples,
+        profile.total_samples,
+    )?;
+    render_count_row(
+        output,
+        "Partially symbolized stack",
+        profile.unresolved_stack_samples,
         profile.total_samples,
     )?;
     writeln!(
         output,
-        "\nKernel and non-kernel leaf rows partition the samples. The unresolved row can overlap either mode.\n"
+        "\nKernel and non-kernel leaf rows partition the samples. Unresolved leaf measures self cost that cannot be attributed to a symbol. Partially symbolized stacks can include address-only system-library roots and overlap the other rows.\n"
     )?;
 
     render_ranked(
@@ -432,14 +439,24 @@ fn render_breakdown(output: &mut String, profile: &FoldedProfile) -> Result<()> 
         output,
         "Inclusive cost counts a frame once when it appears anywhere in a sampled stack. Rows overlap and must not be summed.\n"
     )?;
+    let inclusive_samples = profile
+        .inclusive_samples
+        .iter()
+        .filter(|(frame, _count)| informative_inclusive_frame(frame))
+        .map(|(frame, count)| (frame.clone(), *count))
+        .collect::<BTreeMap<_, _>>();
     render_ranked(
         output,
         "Hottest inclusive frames",
         "Frame",
-        &profile.inclusive_samples,
+        &inclusive_samples,
         profile.total_samples,
         MAX_ROWS,
         false,
+    )?;
+    writeln!(
+        output,
+        "The summary ranking omits unresolved address frames and process bootstrap wrappers. The flamegraph and raw perf reports retain them.\n"
     )?;
     render_hot_stacks(output, profile)?;
     Ok(())
@@ -495,7 +512,8 @@ impl FoldedProfile {
             inclusive_samples: BTreeMap::new(),
             thread_samples: BTreeMap::new(),
             kernel_samples: 0,
-            unresolved_samples: 0,
+            unresolved_leaf_samples: 0,
+            unresolved_stack_samples: 0,
             malformed_lines: 0,
             diagnostics: Vec::new(),
         };
@@ -551,11 +569,17 @@ impl FoldedProfile {
                 .checked_add(count)
                 .context("kernel sample count overflowed")?;
         }
-        if frames.iter().any(|frame| unresolved(frame)) {
-            self.unresolved_samples = self
-                .unresolved_samples
+        if unresolved(leaf) {
+            self.unresolved_leaf_samples = self
+                .unresolved_leaf_samples
                 .checked_add(count)
-                .context("unresolved sample count overflowed")?;
+                .context("unresolved leaf sample count overflowed")?;
+        }
+        if frames.iter().any(|frame| unresolved(frame)) {
+            self.unresolved_stack_samples = self
+                .unresolved_stack_samples
+                .checked_add(count)
+                .context("unresolved stack sample count overflowed")?;
         }
         Ok(())
     }
@@ -701,18 +725,22 @@ fn render_ranked(
 }
 
 fn render_hot_stacks(output: &mut String, profile: &FoldedProfile) -> Result<()> {
-    writeln!(output, "## Hottest complete stacks\n")?;
-    writeln!(output, "| Rank | Stack | Samples | Share |")?;
-    writeln!(output, "| ---: | --- | ---: | ---: |")?;
+    writeln!(output, "## Hottest stack paths\n")?;
+    writeln!(
+        output,
+        "| Rank | Thread | Leaf-side stack | Samples | Share |"
+    )?;
+    writeln!(output, "| ---: | --- | --- | ---: | ---: |")?;
     for (index, (stack, count)) in ranked(&profile.stack_samples, MAX_HOT_STACKS)
         .into_iter()
         .enumerate()
     {
-        let stack = truncate(&stack.replace(';', " -> "), 240);
+        let (thread, stack) = display_stack(stack, 240);
         writeln!(
             output,
-            "| {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} |",
             index + 1,
+            escape_table(thread),
             escape_table(&stack),
             grouped(count),
             format_percent(count, profile.total_samples)
@@ -758,6 +786,16 @@ fn unresolved(frame: &str) -> bool {
     frame.contains("[unknown]")
         || frame.starts_with("0x")
         || (frame.starts_with('[') && frame.contains(" <"))
+}
+
+fn informative_inclusive_frame(frame: &str) -> bool {
+    !unresolved(frame)
+        && !matches!(
+            frame,
+            "<std::sys::thread::unix::Thread>::new::thread_start"
+                | "core::ops::function::FnOnce::call_once{{vtable.shim}}"
+                | "std::sys::backtrace::__rust_begin_short_backtrace"
+        )
 }
 
 fn read_limited(path: &Path, limit: u64) -> Result<String> {
@@ -818,14 +856,38 @@ fn grouped(value: u64) -> String {
     output
 }
 
-fn truncate(value: &str, max_chars: usize) -> String {
-    let mut chars = value.chars();
-    let prefix = chars.by_ref().take(max_chars).collect::<String>();
-    if chars.next().is_some() {
-        format!("{prefix}...")
-    } else {
-        prefix
+fn display_stack(stack: &str, max_chars: usize) -> (&str, String) {
+    const OMITTED: &str = "... -> ";
+
+    let mut frames = stack.split(';');
+    let thread = frames.next().unwrap_or("n/a");
+    let frames = frames.collect::<Vec<_>>();
+    let full = frames.join(" -> ");
+    if full.chars().count() <= max_chars {
+        return (thread, full);
     }
+
+    let available = max_chars.saturating_sub(OMITTED.len());
+    let mut kept = Vec::new();
+    let mut length = 0_usize;
+    for frame in frames.iter().rev() {
+        let separator = usize::from(!kept.is_empty()) * " -> ".len();
+        let next_length = length
+            .saturating_add(separator)
+            .saturating_add(frame.chars().count());
+        if next_length > available {
+            break;
+        }
+        kept.push(*frame);
+        length = next_length;
+    }
+    kept.reverse();
+    if kept.is_empty() {
+        let leaf = frames.last().copied().unwrap_or("n/a");
+        let leaf = leaf.chars().take(available).collect::<String>();
+        return (thread, format!("{OMITTED}{leaf}"));
+    }
+    (thread, format!("{OMITTED}{}", kept.join(" -> ")))
 }
 
 #[cfg(test)]

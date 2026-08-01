@@ -128,9 +128,10 @@ remains a separate process on CPUs 1 through 3.
 
 `o-sfu-load-profile` collapses the captured stacks and uses
 [Inferno](https://github.com/jonhoo/inferno) to generate an interactive SVG
-flamegraph. The job summary reports thread share, kernel share, unresolved
-samples plus hottest leaf symbols, hottest inclusive frames and hottest
-complete stacks. Inclusive rows overlap by definition and must not be summed.
+flamegraph. The job summary reports thread share, kernel share, unresolved leaf
+and partially symbolized stack shares plus hottest leaf symbols, hottest
+inclusive frames and hottest stack paths. Inclusive rows overlap by definition
+and must not be summed.
 The postprocessor expects `perf`, `inferno-collapse-perf` and
 `inferno-flamegraph` on `PATH`. The nightly workflow pins Inferno 0.12.8.
 
