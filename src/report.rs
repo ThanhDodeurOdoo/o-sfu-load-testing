@@ -11,6 +11,8 @@ use serde_json::Value;
 
 use crate::{AUDIO_PACKETS_PER_SECOND, ScenarioResult, ScenarioSpec};
 
+const CATEGORY_CHART_POINTS: usize = 4;
+const CPU_SMOOTHING_RADIUS: usize = 2;
 const CPU_TIMELINE_POINTS: usize = 32;
 const GITHUB_SUMMARY_LIMIT_BYTES: usize = 1024 * 1024;
 const RESULT_LIMIT_BYTES: u64 = 1024 * 1024;
@@ -20,6 +22,7 @@ pub(crate) const MAX_CHART_SCENARIOS: usize = 12;
 const MAX_TELEMETRY_SAMPLES: usize = 10_000;
 const MAX_TELEMETRY_ERRORS: usize = 8;
 const MAX_MERMAID_INTEGER: u64 = 9_007_199_254_740_991;
+const LINE_COLORS: [(&str, &str); 2] = [("Blue", "#388BFD"), ("Orange", "#B86E00")];
 
 #[derive(Clone)]
 pub(crate) struct RunData {
@@ -74,24 +77,14 @@ pub(crate) struct TelemetrySummary {
     pub(crate) packet_loop_delay_ms: Option<u64>,
 }
 
-pub(crate) enum ChartPlot<'a> {
-    Bar(&'a [u64]),
-    Line(&'a [u64]),
+pub(crate) struct ChartSeries<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) values: &'a [u64],
 }
 
-impl ChartPlot<'_> {
-    const fn keyword(&self) -> &'static str {
-        match self {
-            Self::Bar(_) => "bar",
-            Self::Line(_) => "line",
-        }
-    }
-
-    const fn values(&self) -> &[u64] {
-        match self {
-            Self::Bar(values) | Self::Line(values) => values,
-        }
-    }
+struct CpuTimeline {
+    elapsed_ms: u64,
+    values_milli: Vec<u64>,
 }
 
 /// Renders one GitHub job summary from result files or result directories.
@@ -592,19 +585,19 @@ pub(crate) fn render_scenario_legend(output: &mut String) -> Result<()> {
     writeln!(output, "## Scenario label legend\n")?;
     writeln!(
         output,
-        "Tables use hyphenated IDs. Graphs use the shorter space-separated form.\n"
+        "Tables use hyphenated IDs. Graphs use `S` for smoke, `A` for audio mesh and `V` for video gallery.\n"
     )?;
     writeln!(
         output,
-        "- `smoke-2r-50p` or `smoke 2r 50p` means 2 receivers get 50 packets from one publisher."
+        "- `smoke-2r-50p` or `S 2r/50p` means 2 receivers get 50 packets from one publisher."
     )?;
     writeln!(
         output,
-        "- `audio-mesh-2x12-60s` or `audio 2x12 60s` means 2 rooms with 12 peers per room. Every peer publishes audio for 60 seconds."
+        "- `audio-mesh-2x12-60s` or `A 2x12/60s` means 2 rooms with 12 peers per room. Every peer publishes audio for 60 seconds."
     )?;
     writeln!(
         output,
-        "- `video-gallery-1x64-10p-60s` or `video 1x64 10p 60s` means 1 room with 64 peers. 10 peers per room publish video for 60 seconds.\n"
+        "- `video-gallery-1x64-10p-60s` or `V 1x64/10p/60s` means 1 room with 64 peers. 10 peers per room publish video for 60 seconds.\n"
     )?;
     Ok(())
 }
@@ -628,25 +621,34 @@ fn render_delivery(output: &mut String, runs: &[RunData]) -> Result<()> {
         .map(|run| delivered_payload_bits_per_second(&run.result) / 1_000)
         .collect::<Vec<_>>();
     if runs.len() <= MAX_CHART_SCENARIOS {
-        render_chart(
+        render_category_charts(
             output,
             "Observed receiver deliveries per second",
-            "Bars compare receiver-observed delivery rates across scenarios.",
+            "The line compares receiver-observed delivery rates across scenarios.",
             &labels,
             "deliveries/s",
             0,
-            &[ChartPlot::Bar(&delivery_rates)],
+            &[ChartSeries {
+                name: "observed deliveries",
+                values: &delivery_rates,
+            }],
         )?;
-        render_chart(
+        render_category_charts(
             output,
             "Scheduled sender and receiver-observed RTP payload",
-            "Bars compare scheduled sender RTP payload. The line compares receiver-observed RTP payload.",
+            "The first line is scheduled sender RTP payload. The second line is receiver-observed RTP payload.",
             &labels,
             "RTP payload kbit/s",
             0,
             &[
-                ChartPlot::Bar(&scheduled_rates),
-                ChartPlot::Line(&observed_rates),
+                ChartSeries {
+                    name: "scheduled sender",
+                    values: &scheduled_rates,
+                },
+                ChartSeries {
+                    name: "receiver observed",
+                    values: &observed_rates,
+                },
             ],
         )?;
     } else {
@@ -789,14 +791,23 @@ fn render_cpu_overview(
     if chart_labels.is_empty() {
         return Ok(());
     }
-    render_chart(
+    render_category_charts(
         output,
         "SFU CPU average and peak",
-        "Bars are whole-window weighted averages. The line is the sampled peak.",
+        "The first line is the whole-window weighted average. The second line is the sampled peak.",
         &chart_labels,
         "CPU (%)",
         100,
-        &[ChartPlot::Bar(&averages), ChartPlot::Line(&peaks)],
+        &[
+            ChartSeries {
+                name: "weighted average",
+                values: &averages,
+            },
+            ChartSeries {
+                name: "sampled peak",
+                values: &peaks,
+            },
+        ],
     )
 }
 
@@ -815,51 +826,121 @@ fn render_cpu_timeline(output: &mut String, runs: &[RunData]) -> Result<()> {
     else {
         return Ok(());
     };
-    let values = cpu_series(samples)
+    let timeline = cpu_series(samples);
+    let values = moving_average(&timeline.values_milli, CPU_SMOOTHING_RADIUS)
+        .into_iter()
+        .map(|value| rounded_div(value, 1_000))
+        .collect::<Vec<_>>();
+    let bucket_values = timeline
+        .values_milli
         .into_iter()
         .map(|value| rounded_div(value, 1_000))
         .collect::<Vec<_>>();
     let title = format!("SFU CPU timeline: {}", scenario_label(run.result.scenario));
-    render_line_chart(
+    render_cpu_timeline_chart(
         output,
         &title,
-        "Each point is the peak of one contiguous CPU sample bucket from the highest-CPU scenario.",
-        "CPU (%)",
-        100,
+        "Real samples are averaged within equal elapsed-time buckets. The bucket count shrinks instead of interpolating across an empty bucket. The line is a centered five-bucket moving average for the highest-CPU scenario. The sampled peak remains authoritative in the table.",
+        timeline.elapsed_ms.div_ceil(1_000).max(1),
         &values,
     )?;
-    write!(output, "Chart values by sample bucket (CPU %): ")?;
+    write!(output, "CPU values by elapsed-time bucket (%): ")?;
+    write_indexed_values(output, &bucket_values)?;
+    write!(output, "\nSmoothed CPU values by sample bucket (%): ")?;
+    write_indexed_values(output, &values)?;
+    writeln!(output, "\n")?;
+    Ok(())
+}
+
+fn write_indexed_values(output: &mut String, values: &[u64]) -> Result<()> {
     for (index, value) in values.iter().enumerate() {
         if index > 0 {
             write!(output, ", ")?;
         }
         write!(output, "{index}={value}")?;
     }
-    writeln!(output, "\n")?;
     Ok(())
 }
 
-fn cpu_series(samples: &[TelemetrySample]) -> Vec<u64> {
-    let values = samples
+fn cpu_series(samples: &[TelemetrySample]) -> CpuTimeline {
+    let points = samples
         .iter()
-        .filter_map(|sample| sample.server_cpu_percent_milli)
+        .filter_map(|sample| Some((sample.elapsed_ms, sample.server_cpu_percent_milli?)))
         .collect::<Vec<_>>();
-    let buckets = values.len().min(CPU_TIMELINE_POINTS);
-    let mut output = Vec::with_capacity(buckets);
-    for bucket in 0..buckets {
-        let start = bucket * values.len() / buckets;
-        let end = (bucket + 1) * values.len() / buckets;
-        output.push(
-            values
+    let Some((first_ms, first_value)) = points.first().copied() else {
+        return CpuTimeline {
+            elapsed_ms: 0,
+            values_milli: Vec::new(),
+        };
+    };
+    let Some((last_ms, _last_value)) = points.last().copied() else {
+        return CpuTimeline {
+            elapsed_ms: 0,
+            values_milli: Vec::new(),
+        };
+    };
+    let elapsed_ms = last_ms.saturating_sub(first_ms);
+    let maximum_buckets = points.len().min(CPU_TIMELINE_POINTS);
+    if maximum_buckets == 1 || elapsed_ms == 0 {
+        return CpuTimeline {
+            elapsed_ms,
+            values_milli: vec![first_value],
+        };
+    }
+    for buckets in (1..=maximum_buckets).rev() {
+        let mut sums = vec![0_u128; buckets];
+        let mut counts = vec![0_u64; buckets];
+        for (sample_ms, value) in &points {
+            let offset = sample_ms.saturating_sub(first_ms);
+            let index = usize::try_from(
+                u128::from(offset) * u128::try_from(buckets).unwrap_or(u128::MAX)
+                    / (u128::from(elapsed_ms) + 1),
+            )
+            .unwrap_or(buckets - 1)
+            .min(buckets - 1);
+            if let (Some(sum), Some(count)) = (sums.get_mut(index), counts.get_mut(index)) {
+                *sum = sum.saturating_add(u128::from(*value));
+                *count = count.saturating_add(1);
+            }
+        }
+        if counts.iter().all(|count| *count > 0) {
+            let values_milli = sums
+                .into_iter()
+                .zip(counts)
+                .map(|(sum, count)| u64::try_from(sum / u128::from(count)).unwrap_or(u64::MAX))
+                .collect();
+            return CpuTimeline {
+                elapsed_ms,
+                values_milli,
+            };
+        }
+    }
+    CpuTimeline {
+        elapsed_ms,
+        values_milli: vec![first_value],
+    }
+}
+
+pub(crate) fn moving_average(values: &[u64], radius: usize) -> Vec<u64> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, _value)| {
+            let start = index.saturating_sub(radius);
+            let end = index
+                .saturating_add(radius)
+                .saturating_add(1)
+                .min(values.len());
+            let (sum, count) = values
                 .iter()
                 .skip(start)
                 .take(end.saturating_sub(start))
-                .copied()
-                .max()
-                .unwrap_or_default(),
-        );
-    }
-    output
+                .fold((0_u128, 0_u128), |(sum, count), value| {
+                    (sum.saturating_add(u128::from(*value)), count + 1)
+                });
+            u64::try_from(sum / count.max(1)).unwrap_or(u64::MAX)
+        })
+        .collect()
 }
 
 fn render_telemetry_issues(output: &mut String, runs: &[RunData]) -> Result<()> {
@@ -945,20 +1026,20 @@ fn render_metric_table(
     Ok(())
 }
 
-pub(crate) fn render_chart(
+pub(crate) fn render_category_charts(
     output: &mut String,
     title: &str,
     description: &str,
     labels: &[String],
     y_axis: &str,
     minimum: u64,
-    plots: &[ChartPlot<'_>],
+    series: &[ChartSeries<'_>],
 ) -> Result<()> {
     ensure!(!labels.is_empty(), "chart labels cannot be empty");
-    ensure!(!plots.is_empty(), "chart plots cannot be empty");
+    ensure!(!series.is_empty(), "chart series cannot be empty");
     ensure!(
-        plots.iter().all(|plot| plot.values().len() == labels.len()),
-        "chart plot lengths must match chart labels"
+        series.iter().all(|line| line.values.len() == labels.len()),
+        "chart series lengths must match chart labels"
     );
     if labels.len() > MAX_CHART_SCENARIOS {
         writeln!(
@@ -967,20 +1048,111 @@ pub(crate) fn render_chart(
         )?;
         return Ok(());
     }
-    if plots.iter().any(|plot| {
-        plot.values()
-            .iter()
-            .any(|value| *value > MAX_MERMAID_INTEGER)
-    }) {
+    if series
+        .iter()
+        .any(|line| line.values.iter().any(|value| *value > MAX_MERMAID_INTEGER))
+    {
         writeln!(
             output,
             "The {title} chart is omitted because a value exceeds Mermaid's exact-integer range. The tabular metrics remain available.\n"
         )?;
         return Ok(());
     }
-    let maximum = chart_axis_max(plots.iter().flat_map(ChartPlot::values), minimum);
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    while start < labels.len() {
+        let remaining = labels.len() - start;
+        let size = if remaining == CATEGORY_CHART_POINTS + 1 {
+            CATEGORY_CHART_POINTS - 1
+        } else {
+            remaining.min(CATEGORY_CHART_POINTS)
+        };
+        ranges.push(start..start + size);
+        start += size;
+    }
+    let chunk_count = ranges.len();
+    if chunk_count > 1 {
+        writeln!(
+            output,
+            "The {title} chart is split into {chunk_count} panels. Each panel uses its own y-axis scale.\n"
+        )?;
+    }
+    for (chunk_index, range) in ranges.into_iter().enumerate() {
+        let chart_labels = labels
+            .get(range.clone())
+            .context("chart label chunk is outside its labels")?;
+        let chart_title = if chunk_count == 1 {
+            title.to_owned()
+        } else {
+            format!("{title} ({}/{chunk_count})", chunk_index + 1)
+        };
+        let chart_series = series
+            .iter()
+            .map(|line| {
+                let values = line
+                    .values
+                    .get(range.clone())
+                    .context("chart series chunk is outside its values")?;
+                Ok(ChartSeries {
+                    name: line.name,
+                    values,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let maximum = chart_axis_max(chart_series.iter().flat_map(|line| line.values), minimum);
+        render_category_chart(
+            output,
+            &chart_title,
+            description,
+            chart_labels,
+            y_axis,
+            maximum,
+            &chart_series,
+        )?;
+    }
+    Ok(())
+}
+
+fn render_category_chart(
+    output: &mut String,
+    title: &str,
+    description: &str,
+    labels: &[String],
+    y_axis: &str,
+    maximum: u64,
+    series: &[ChartSeries<'_>],
+) -> Result<()> {
+    ensure!(
+        series.len() <= LINE_COLORS.len(),
+        "chart has more lines than its color palette"
+    );
     writeln!(output, "{description}\n")?;
+    if labels.len() == 1 {
+        writeln!(
+            output,
+            "The single value is repeated once so Mermaid draws a visible line segment.\n"
+        )?;
+    }
+    write!(output, "Series colors: ")?;
+    for (index, (line, (color, hex))) in series.iter().zip(LINE_COLORS).enumerate() {
+        if index > 0 {
+            write!(output, ". ")?;
+        }
+        write!(output, "{color} (`{hex}`) = {}", line.name)?;
+    }
+    writeln!(output, ".\n")?;
     writeln!(output, "```mermaid")?;
+    writeln!(output, "---")?;
+    writeln!(output, "config:")?;
+    writeln!(output, "  themeVariables:")?;
+    writeln!(output, "    xyChart:")?;
+    let palette = LINE_COLORS
+        .iter()
+        .map(|(_name, hex)| *hex)
+        .collect::<Vec<_>>()
+        .join(", ");
+    writeln!(output, "      plotColorPalette: \"{palette}\"")?;
+    writeln!(output, "---")?;
     writeln!(output, "xychart-beta")?;
     writeln!(output, "    accTitle: {title}")?;
     writeln!(output, "    accDescr: {description}")?;
@@ -992,23 +1164,32 @@ pub(crate) fn render_chart(
         }
         write!(output, "\"{label}\"")?;
     }
+    if labels.len() == 1 {
+        write!(output, ", \"\"")?;
+    }
     writeln!(output, "]")?;
     writeln!(output, "    y-axis \"{y_axis}\" 0 --> {maximum}")?;
-    for plot in plots {
-        write!(output, "    {} [", plot.keyword())?;
-        write_values(output, plot.values())?;
+    for line in series {
+        write!(output, "    line [")?;
+        write_values(output, line.values)?;
+        if line.values.len() == 1 {
+            write!(
+                output,
+                ", {}",
+                line.values.first().copied().unwrap_or_default()
+            )?;
+        }
         writeln!(output, "]")?;
     }
     writeln!(output, "```\n")?;
     Ok(())
 }
 
-fn render_line_chart(
+fn render_cpu_timeline_chart(
     output: &mut String,
     title: &str,
     description: &str,
-    y_axis: &str,
-    y_minimum: u64,
+    x_maximum: u64,
     values: &[u64],
 ) -> Result<()> {
     ensure!(!values.is_empty(), "line chart values cannot be empty");
@@ -1023,20 +1204,20 @@ fn render_line_chart(
         )?;
         return Ok(());
     }
-    let last_bucket = u64::try_from(values.len().saturating_sub(1))
-        .unwrap_or(1)
-        .max(1);
-    let maximum = chart_axis_max(values.iter(), y_minimum);
+    let maximum = chart_axis_max(values.iter(), 100);
     writeln!(output, "{description}\n")?;
     writeln!(output, "```mermaid")?;
     writeln!(output, "xychart-beta")?;
     writeln!(output, "    accTitle: {title}")?;
     writeln!(output, "    accDescr: {description}")?;
     writeln!(output, "    title \"{title}\"")?;
-    writeln!(output, "    x-axis \"sample bucket\" 0 --> {last_bucket}")?;
-    writeln!(output, "    y-axis \"{y_axis}\" 0 --> {maximum}")?;
+    writeln!(output, "    x-axis \"elapsed (s)\" 0 --> {x_maximum}")?;
+    writeln!(output, "    y-axis \"CPU (%)\" 0 --> {maximum}")?;
     write!(output, "    line [")?;
     write_values(output, values)?;
+    if values.len() == 1 {
+        write!(output, ", {}", values.first().copied().unwrap_or_default())?;
+    }
     writeln!(output, "]")?;
     writeln!(output, "```\n")?;
     Ok(())
@@ -1137,21 +1318,26 @@ pub(crate) fn delivery_rate(result: &ScenarioResult) -> u64 {
     result.achieved_deliveries_per_second()
 }
 
-pub(crate) fn scenario_key(spec: ScenarioSpec) -> (u8, u32, u32, u32, u32, u64) {
+pub(crate) fn scenario_key(spec: ScenarioSpec) -> (u8, u64, u64, u32, u32, u32, u32) {
     let rank = match spec {
         ScenarioSpec::Smoke { .. } => 0,
         ScenarioSpec::AudioMesh { .. } => 1,
         ScenarioSpec::VideoGallery { .. } => 2,
     };
+    let duration = u64::from(spec.duration_seconds()).max(1);
+    let expected_deliveries = spec
+        .plan()
+        .map(|plan| plan.expected_deliveries)
+        .unwrap_or_default();
+    let deliveries_per_second = expected_deliveries / duration;
     (
         rank,
+        deliveries_per_second,
+        expected_deliveries,
         spec.room_count(),
         spec.peers_per_room(),
         spec.publishers_per_room(),
         spec.duration_seconds(),
-        spec.plan()
-            .map(|plan| plan.expected_deliveries)
-            .unwrap_or_default(),
     )
 }
 
@@ -1177,19 +1363,19 @@ pub(crate) fn scenario_label(spec: ScenarioSpec) -> String {
 pub(crate) fn chart_label(spec: ScenarioSpec) -> String {
     match spec {
         ScenarioSpec::Smoke { receivers, packets } => {
-            format!("smoke {receivers}r {packets}p")
+            format!("S {receivers}r/{packets}p")
         }
         ScenarioSpec::AudioMesh {
             rooms,
             peers,
             seconds,
-        } => format!("audio {rooms}x{peers} {seconds}s"),
+        } => format!("A {rooms}x{peers}/{seconds}s"),
         ScenarioSpec::VideoGallery {
             rooms,
             peers,
             publishers,
             seconds,
-        } => format!("video {rooms}x{peers} {publishers}p {seconds}s"),
+        } => format!("V {rooms}x{peers}/{publishers}p/{seconds}s"),
     }
 }
 

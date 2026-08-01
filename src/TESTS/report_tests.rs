@@ -1,9 +1,10 @@
 use serde_json::json;
 
 use super::{
-    GITHUB_SUMMARY_LIMIT_BYTES, LoadFailure, RunData, SampleSet, TelemetrySummary, chart_axis_max,
-    cpu_micros_per_million, delivery_rate, ensure_summary_size, escape_table, format_mebibytes,
-    parse_samples, render_report, validate_artifact_url,
+    ChartSeries, GITHUB_SUMMARY_LIMIT_BYTES, LoadFailure, RunData, SampleSet, TelemetrySummary,
+    chart_axis_max, cpu_micros_per_million, cpu_series, delivery_rate, ensure_summary_size,
+    escape_table, format_mebibytes, moving_average, parse_samples, render_category_charts,
+    render_report, validate_artifact_url,
 };
 use crate::{ScenarioResult, ScenarioSpec};
 
@@ -21,18 +22,37 @@ fn report_sorts_workloads_and_renders_visual_rates() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("mesh workload is missing"))?;
 
     assert!(smoke_position < mesh_position);
-    assert!(report.contains("```mermaid\nxychart-beta"));
+    assert!(report.contains("```mermaid\n---\nconfig:"));
+    assert!(report.contains("plotColorPalette: \"#388BFD, #B86E00\""));
     assert!(report.contains("title \"Observed receiver deliveries per second\""));
-    assert!(report.contains("x-axis [\"smoke 1r 50p\", \"audio 1x10 1s\"]"));
-    assert!(report.contains("bar [50, 4500]"));
+    assert!(report.contains("x-axis [\"S 1r/50p\", \"A 1x10/1s\"]"));
+    assert!(report.contains("line [50, 4500]"));
     assert!(report.contains("title \"Scheduled sender and receiver-observed RTP payload\""));
-    assert!(report.contains("bar [64, 640]"));
+    assert!(report.contains("line [64, 640]"));
     assert!(report.contains("line [64, 5760]"));
+    assert!(!report.contains("    bar ["));
     assert!(report.contains("accTitle: Observed receiver deliveries per second"));
-    assert!(report.contains("accDescr: Bars compare receiver-observed delivery rates"));
+    assert!(report.contains("accDescr: The line compares receiver-observed delivery rates"));
     assert!(report.contains("## Scenario label legend"));
-    assert!(report.contains("`video-gallery-1x64-10p-60s` or `video 1x64 10p 60s`"));
+    assert!(report.contains("`video-gallery-1x64-10p-60s` or `V 1x64/10p/60s`"));
     assert!(report.contains("| audio-mesh-1x10-1s | 4,500 | 4,500 | 4,500/s |"));
+    Ok(())
+}
+
+#[test]
+fn report_orders_each_workload_family_by_planned_rate() -> anyhow::Result<()> {
+    let high = run(ScenarioSpec::audio_mesh(1, 28, 120)?, None, 0)?;
+    let low = run(ScenarioSpec::audio_mesh(2, 12, 60)?, None, 0)?;
+
+    let report = render_runs(vec![high, low], None)?;
+    let low_position = report
+        .find("A 2x12/60s")
+        .ok_or_else(|| anyhow::anyhow!("low-rate scenario is missing"))?;
+    let high_position = report
+        .find("A 1x28/120s")
+        .ok_or_else(|| anyhow::anyhow!("high-rate scenario is missing"))?;
+
+    assert!(low_position < high_position);
     Ok(())
 }
 
@@ -46,7 +66,7 @@ fn report_marks_delivery_discrepancies_and_send_lag() -> anyhow::Result<()> {
     assert!(report.contains("| FAIL | 1 | 0 | n/a | deadbeef |"));
     assert!(report.contains("Performance samples: **INVALID**"));
     assert!(report.contains("| 37 ms |"));
-    assert!(report.contains("bar [99]"));
+    assert!(report.contains("line [99, 99]"));
     assert!(report.contains("| smoke-2r-50p | 100 | 99 | 99/s |"));
     assert!(report.contains("| smoke-2r-50p | 1 | 0 | 0 | 0 | 0 | 1 |"));
     Ok(())
@@ -123,12 +143,13 @@ not-json
     assert!(report.contains("| smoke-1r-50p | 3 | 2 | 2,000 ms | yes | yes |"));
     assert!(report.contains("title \"SFU CPU average and peak\""));
     assert!(report.contains("y-axis \"CPU (%)\" 0 --> 100"));
-    assert!(report.contains("bar [75]"));
-    assert!(report.contains("line [100]"));
+    assert!(report.contains("line [75, 75]"));
+    assert!(report.contains("line [100, 100]"));
     assert!(report.contains("title \"SFU CPU timeline: smoke-1r-50p\""));
-    assert!(report.contains("x-axis \"sample bucket\" 0 --> 1"));
-    assert!(report.contains("line [50, 100]"));
-    assert!(report.contains("Chart values by sample bucket (CPU %): 0=50, 1=100"));
+    assert!(report.contains("x-axis \"elapsed (s)\" 0 --> 1"));
+    assert!(report.contains("line [75, 75]"));
+    assert!(report.contains("CPU values by elapsed-time bucket (%): 0=50, 1=100"));
+    assert!(report.contains("Smoothed CPU values by sample bucket (%): 0=75, 1=75"));
     assert!(report.contains("| smoke-1r-50p | 75.000% | 100.000% |"));
     assert!(report.contains("166 deliveries/CPU-s"));
     assert!(report.contains("50 packets/s"));
@@ -138,6 +159,25 @@ not-json
     assert!(report.contains("## Telemetry issues"));
     assert!(report.contains("malformed telemetry record"));
     assert!(report.contains("scrape failed"));
+    Ok(())
+}
+
+#[test]
+fn cpu_timeline_smooths_milli_percent_before_rounding() -> anyhow::Result<()> {
+    let samples = parse_samples(
+        r#"
+{"elapsedMs":0,"serverCpuPercentMilli":1499}
+{"elapsedMs":1000,"serverCpuPercentMilli":1499}
+{"elapsedMs":2000,"serverCpuPercentMilli":2501}
+"#,
+    );
+    let report = render_runs(
+        vec![run(ScenarioSpec::smoke(1, 50)?, None, 0)?.with_samples(samples)],
+        None,
+    )?;
+
+    assert!(report.contains("line [2, 2, 2]"));
+    assert!(report.contains("CPU values by elapsed-time bucket (%): 0=1, 1=1, 2=3"));
     Ok(())
 }
 
@@ -183,11 +223,10 @@ fn cpu_chart_keeps_scenarios_with_explicit_percent_samples() -> anyhow::Result<(
     )?;
 
     assert!(report.contains("title \"SFU CPU average and peak\""));
-    assert!(report.contains("x-axis [\"smoke 1r 50p\"]"));
-    assert!(report.contains("bar [10]"));
-    assert!(report.contains("line [10]"));
+    assert!(report.contains("x-axis [\"S 1r/50p\", \"\"]"));
+    assert_eq!(report.matches("line [10, 10]").count(), 3);
     assert!(report.contains(
-        "CPU chart requires an interval-weighted average and sampled peak. Omitted scenarios: smoke 2r 50p."
+        "CPU chart requires an interval-weighted average and sampled peak. Omitted scenarios: S 2r/50p."
     ));
     Ok(())
 }
@@ -202,7 +241,7 @@ fn cpu_chart_discloses_single_sample_omission() -> anyhow::Result<()> {
 
     assert!(!report.contains("title \"SFU CPU average and peak\""));
     assert!(report.contains(
-        "CPU chart requires an interval-weighted average and sampled peak. Omitted scenarios: smoke 1r 50p."
+        "CPU chart requires an interval-weighted average and sampled peak. Omitted scenarios: S 1r/50p."
     ));
     assert!(report.contains("title \"SFU CPU timeline: smoke-1r-50p\""));
     Ok(())
@@ -215,8 +254,8 @@ fn scheduled_sender_rate_excludes_receiver_drain_time() -> anyhow::Result<()> {
 
     let report = render_runs(vec![delayed], None)?;
 
-    assert!(report.contains("bar [64]"));
-    assert!(report.contains("line [32]"));
+    assert!(report.contains("line [64, 64]"));
+    assert!(report.contains("line [32, 32]"));
     assert!(report.contains("| 64.0 kbit/s | 32.0 kbit/s |"));
     Ok(())
 }
@@ -315,6 +354,62 @@ fn chart_scale_keeps_cpu_headroom_and_zero_range_valid() {
     assert_eq!(chart_axis_max([&zero].into_iter(), 0), 1);
     assert_eq!(chart_axis_max([&partial_cpu].into_iter(), 100), 100);
     assert_eq!(chart_axis_max([&saturated_cpu].into_iter(), 100), 120);
+}
+
+#[test]
+fn category_charts_avoid_singleton_facets_and_scale_each_panel() -> anyhow::Result<()> {
+    let labels = (1..=5)
+        .map(|value| format!("A {value}"))
+        .collect::<Vec<_>>();
+    let values = [1, 2, 3, 1_000, 2_000];
+    let mut output = String::new();
+
+    render_category_charts(
+        &mut output,
+        "Load",
+        "Load by scenario.",
+        &labels,
+        "work/s",
+        0,
+        &[ChartSeries {
+            name: "load",
+            values: &values,
+        }],
+    )?;
+
+    assert!(output.contains("x-axis [\"A 1\", \"A 2\", \"A 3\"]"));
+    assert!(output.contains("x-axis [\"A 4\", \"A 5\"]"));
+    assert!(output.contains("y-axis \"work/s\" 0 --> 4"));
+    assert!(output.contains("y-axis \"work/s\" 0 --> 2200"));
+    Ok(())
+}
+
+#[test]
+fn moving_average_smooths_without_changing_length_or_range() {
+    assert!(moving_average(&[], 2).is_empty());
+    assert_eq!(moving_average(&[10], 2), [10]);
+    assert_eq!(moving_average(&[0, 0, 100, 0, 0], 1), [0, 33, 33, 33, 0]);
+    assert_eq!(
+        moving_average(&[10, 20, 30, 40, 50], 2),
+        [20, 25, 30, 35, 40]
+    );
+}
+
+#[test]
+fn cpu_timeline_reduces_bucket_count_across_scrape_gaps() {
+    let samples = parse_samples(
+        r#"
+{"elapsedMs":0,"serverCpuPercentMilli":0}
+{"elapsedMs":1000,"serverCpuPercentMilli":100000}
+{"elapsedMs":9000,"serverCpuPercentMilli":0}
+{"elapsedMs":10000,"serverCpuPercentMilli":100000}
+"#,
+    );
+
+    let timeline = cpu_series(&samples.samples);
+
+    assert_eq!(timeline.elapsed_ms, 10_000);
+    assert_eq!(timeline.values_milli, [50_000, 50_000]);
 }
 
 #[test]

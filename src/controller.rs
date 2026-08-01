@@ -21,6 +21,7 @@ use tokio::{
 
 use crate::{
     AUTH_KEY, ScenarioResult, ScenarioSpec,
+    profile::ServerProfiler,
     telemetry::{TelemetryConfig, TelemetrySampler},
 };
 
@@ -38,6 +39,7 @@ pub struct RunConfig {
     pub output_directory: PathBuf,
     pub server_cpus: Option<String>,
     pub rtc_cpus: Option<String>,
+    pub profile_server: bool,
     pub spec: ScenarioSpec,
 }
 
@@ -52,7 +54,7 @@ struct RtcWorkerArtifacts<'a> {
 /// # Errors
 ///
 /// Returns an error when process startup, readiness, RTC work, result
-/// validation or graceful shutdown fails.
+/// validation, profiling or graceful shutdown fails.
 pub async fn run(config: RunConfig) -> Result<ScenarioResult> {
     validate_cpu_set(config.server_cpus.as_deref())?;
     validate_cpu_set(config.rtc_cpus.as_deref())?;
@@ -72,6 +74,21 @@ pub async fn run(config: RunConfig) -> Result<ScenarioResult> {
     let mut shutdown_signals = ShutdownSignals::new()?;
     let (mut server, base_url, websocket_url) =
         start_server(&config, &mut shutdown_signals).await?;
+    let profiler = if config.profile_server {
+        let server_pid = server.id().context("o-sfu process has no process id")?;
+        match ServerProfiler::start(server_pid, &config.output_directory).await {
+            Ok(profiler) => Some(profiler),
+            Err(error) => {
+                let shutdown_result = stop_server(&mut server).await;
+                return combine_run_and_shutdown(
+                    Err(error.context("failed to start o-sfu profiling")),
+                    shutdown_result,
+                );
+            }
+        }
+    } else {
+        None
+    };
     let mut server_exited = false;
     let run_result = async {
         match run_rtc_worker(
@@ -103,12 +120,30 @@ pub async fn run(config: RunConfig) -> Result<ScenarioResult> {
         Ok(result)
     }
     .await;
+    let profile_result = match profiler {
+        Some(profiler) => profiler.finish().await,
+        None => Ok(()),
+    };
+    let run_result = combine_run_and_profile(run_result, profile_result);
     let shutdown_result = if server_exited {
         Ok(())
     } else {
         stop_server(&mut server).await
     };
     combine_run_and_shutdown(run_result, shutdown_result)
+}
+
+fn combine_run_and_profile(
+    run_result: Result<ScenarioResult>,
+    profile_result: Result<()>,
+) -> Result<ScenarioResult> {
+    match (run_result, profile_result) {
+        (Ok(result), Ok(())) => Ok(result),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(run_error), Err(profile_error)) => Err(anyhow!(
+            "RTC work failed: {run_error:#}. profile shutdown also failed: {profile_error:#}"
+        )),
+    }
 }
 
 async fn start_server(

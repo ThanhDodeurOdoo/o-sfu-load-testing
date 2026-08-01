@@ -24,7 +24,7 @@ concurrency:
 jobs:
   load:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - name: Check out repository
@@ -132,7 +132,7 @@ jobs:
             if [[ "$revisions" != "$expected" ]]; then
               echo "Cargo.lock resolved unexpected o-sfu revisions:" >&2
               echo "$revisions" >&2
-              exit 1
+              return 1
             fi
           }
 
@@ -225,6 +225,254 @@ jobs:
 
           exit "$status"
 
+      - name: Prepare CPU profiler
+        id: profiler
+        if: success()
+        run: |
+          set -uo pipefail
+          mkdir -p artifacts
+          log=artifacts/profile-availability.txt
+          available=false
+
+          prepare_perf() {
+            if ! perf version; then
+              sudo apt-get update || return 1
+              sudo apt-get install -y \
+                linux-tools-common "linux-tools-$(uname -r)" || \
+                sudo apt-get install -y linux-tools-common linux-tools-azure || \
+                return 1
+            fi
+            if ! perf version; then
+              local perf_directory="$RUNNER_TEMP/o-sfu-profile-bin"
+              local perf_binary
+              perf_binary=$(find /usr/lib/linux-tools \
+                -type f -name perf -perm -111 | sort -V | tail -n 1)
+              [[ -n "$perf_binary" ]] || return 1
+              mkdir -p "$perf_directory" || return 1
+              ln -sf "$perf_binary" "$perf_directory/perf" || return 1
+              export PATH="$perf_directory:$PATH"
+              echo "$perf_directory" >> "$GITHUB_PATH" || return 1
+            fi
+            sudo sysctl -w kernel.perf_event_paranoid=-1 || return 1
+            sudo sysctl -w kernel.kptr_restrict=0 || return 1
+            perf version || return 1
+            perf record \
+              --event cpu-clock \
+              --freq 99 \
+              --call-graph fp \
+              --strict-freq \
+              --output "$RUNNER_TEMP/o-sfu-perf-probe.data" \
+              -- sleep 1 || return 1
+            perf report \
+              --stdio \
+              --header-only \
+              --input "$RUNNER_TEMP/o-sfu-perf-probe.data" || return 1
+            if ! command -v rsvg-convert > /dev/null; then
+              sudo apt-get update || return 1
+              sudo apt-get install -y librsvg2-bin || return 1
+            fi
+            rsvg-convert --version || return 1
+            local inferno_root="$RUNNER_TEMP/inferno-0.12.8"
+            cargo install inferno \
+              --version 0.12.8 \
+              --locked \
+              --root "$inferno_root" \
+              --no-default-features \
+              --features cli \
+              --bin inferno-collapse-perf \
+              --bin inferno-flamegraph || return 1
+            export PATH="$inferno_root/bin:$PATH"
+            echo "$inferno_root/bin" >> "$GITHUB_PATH" || return 1
+            echo 'O_SFU_LOAD_INFERNO_VERSION=0.12.8' >> "$GITHUB_ENV" || \
+              return 1
+            inferno-collapse-perf --help > /dev/null || return 1
+            inferno-flamegraph --help > /dev/null || return 1
+          }
+
+          if prepare_perf > "$log" 2>&1; then
+            available=true
+          fi
+          echo "available=$available" >> "$GITHUB_OUTPUT"
+          cat "$log"
+          if [[ "$available" != true ]]; then
+            echo "::warning::The CPU profiler is unavailable. The load results remain valid but this run has no CPU profile."
+          else
+            cargo_home=$(dirname "$(dirname "$(command -v cargo)")")
+            inferno_license=$(find "$cargo_home/registry/src" \
+              -path '*/inferno-0.12.8/LICENSE' -print -quit)
+            if [[ -n "$inferno_license" ]]; then
+              cp "$inferno_license" artifacts/INFERNO-LICENSE || \
+                echo "::warning::Could not retain the Inferno license in the artifact."
+            fi
+          fi
+
+      - name: Build profiling server
+        id: profile-build
+        if: steps.profiler.outputs.available == 'true'
+        continue-on-error: true
+        env:
+          BASELINE_REVISION: ${{ steps.revisions.outputs.baseline_revision }}
+          COMPARISON_REVISION: ${{ steps.revisions.outputs.comparison_revision }}
+          MODE: ${{ steps.revisions.outputs.mode }}
+        run: |
+          set -uo pipefail
+
+          original_lock="$RUNNER_TEMP/o-sfu-load-Cargo.lock"
+          cp Cargo.lock "$original_lock" || exit 1
+          restore_lock() {
+            cp "$original_lock" Cargo.lock
+          }
+          trap restore_lock EXIT
+
+          verify_lock() {
+            local expected=$1
+            local revisions
+            revisions=$(awk '
+              index($0, "source = \"git+https://github.com/ThanhDodeurOdoo/o-sfu") == 1 {
+                split($0, parts, "#")
+                revision = parts[length(parts)]
+                sub(/\"$/, "", revision)
+                print revision
+              }
+            ' Cargo.lock | sort -u) || return 1
+            if [[ "$revisions" != "$expected" ]]; then
+              echo "Cargo.lock resolved unexpected o-sfu revisions:" >&2
+              echo "$revisions" >&2
+              return 1
+            fi
+          }
+
+          build_profile_server() {
+            local revision=$1
+            local target_directory=$2
+            local lock=$3
+            cp "$lock" Cargo.lock || return 1
+            verify_lock "$revision" || return 1
+            CARGO_TARGET_DIR="$target_directory" \
+              CARGO_PROFILE_RELEASE_DEBUG=1 \
+              CARGO_PROFILE_RELEASE_STRIP=none \
+              RUSTFLAGS='-Cforce-frame-pointers=yes -Clink-arg=-Wl,--no-rosegment' \
+              cargo build --locked --release --bin o-sfu-load-server || return 1
+          }
+
+          status=0
+          if [[ "$MODE" == single ]]; then
+            build_profile_server "$BASELINE_REVISION" \
+              target/profile "$original_lock" || status=1
+          else
+            build_profile_server "$BASELINE_REVISION" \
+              target/profile-baseline artifacts/baseline/Cargo.lock || status=1
+            build_profile_server "$COMPARISON_REVISION" \
+              target/profile-comparison artifacts/comparison/Cargo.lock || status=1
+          fi
+
+          restore_lock || status=1
+          trap - EXIT
+          exit "$status"
+
+      - name: Capture CPU profiles
+        id: cpu-profile
+        if: steps.profiler.outputs.available == 'true'
+        continue-on-error: true
+        env:
+          MODE: ${{ steps.revisions.outputs.mode }}
+        run: |
+          set -uo pipefail
+          status=0
+
+          capture_profile() {
+            local run_directory=$1
+            local profile_directory=$2
+            local output=$3
+            local lock=$4
+            [[ -x "$profile_directory/release/o-sfu-load-server" ]] || return 1
+            mkdir -p "$output" || return 1
+            cp "$profile_directory/release/o-sfu-load-server" \
+              "$output/o-sfu-load-server" || return 1
+            cp "$lock" "$output/Cargo.lock" || return 1
+            "$run_directory/release/o-sfu-load" \
+              --server-binary "$profile_directory/release/o-sfu-load-server" \
+              --rtc-binary "$run_directory/release/o-sfu-load-rtc" \
+              --server-cpus 0 \
+              --rtc-cpus 1-3 \
+              --profile-server \
+              --output "$output" \
+              audio-mesh --rooms 1 --peers 28 --seconds 120 || return 1
+            "$run_directory/release/o-sfu-load-profile" \
+              prepare --input "$output" || return 1
+          }
+
+          capture_with_log() {
+            local output=$3
+            mkdir -p "$output" || return 1
+            if capture_profile "$@" > "$output/profile-workflow.log" 2>&1; then
+              cat "$output/profile-workflow.log"
+              echo AVAILABLE > "$output/profile-status.txt"
+              return 0
+            else
+              local capture_status=$?
+              cat "$output/profile-workflow.log"
+              echo UNAVAILABLE > "$output/profile-status.txt"
+              return "$capture_status"
+            fi
+          }
+
+          if [[ "$MODE" == single ]]; then
+            capture_with_log target target/profile \
+              artifacts/profile/audio-1x28 Cargo.lock || status=1
+            if [[ -s artifacts/profile/audio-1x28/profile.ready ]]; then
+              rsvg-convert --width 1800 \
+                --output artifacts/o-sfu-flamegraph.png \
+                artifacts/profile/audio-1x28/flamegraph.svg || status=1
+            fi
+          else
+            capture_with_log target/baseline target/profile-baseline \
+              artifacts/profile/baseline/audio-1x28 \
+              artifacts/baseline/Cargo.lock || status=1
+            capture_with_log target/comparison target/profile-comparison \
+              artifacts/profile/comparison/audio-1x28 \
+              artifacts/comparison/Cargo.lock || status=1
+            if [[ -s artifacts/profile/baseline/audio-1x28/profile.ready ]]; then
+              rsvg-convert --width 1800 \
+                --output artifacts/o-sfu-flamegraph-baseline.png \
+                artifacts/profile/baseline/audio-1x28/flamegraph.svg || status=1
+            fi
+            if [[ -s artifacts/profile/comparison/audio-1x28/profile.ready ]]; then
+              rsvg-convert --width 1800 \
+                --output artifacts/o-sfu-flamegraph-comparison.png \
+                artifacts/profile/comparison/audio-1x28/flamegraph.svg || status=1
+            fi
+          fi
+
+          exit "$status"
+
+      - name: Upload CPU flamegraph preview
+        id: flamegraph
+        if: always() && steps.revisions.outputs.mode == 'single' && hashFiles('artifacts/o-sfu-flamegraph.png') != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          path: artifacts/o-sfu-flamegraph.png
+          archive: false
+          retention-days: 30
+
+      - name: Upload baseline CPU flamegraph preview
+        id: flamegraph-baseline
+        if: always() && steps.revisions.outputs.mode == 'comparison' && hashFiles('artifacts/o-sfu-flamegraph-baseline.png') != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          path: artifacts/o-sfu-flamegraph-baseline.png
+          archive: false
+          retention-days: 30
+
+      - name: Upload comparison CPU flamegraph preview
+        id: flamegraph-comparison
+        if: always() && steps.revisions.outputs.mode == 'comparison' && hashFiles('artifacts/o-sfu-flamegraph-comparison.png') != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          path: artifacts/o-sfu-flamegraph-comparison.png
+          archive: false
+          retention-days: 30
+
       - name: Upload load artifacts
         id: load-artifact
         if: always()
@@ -294,3 +542,86 @@ jobs:
           fi
 
           cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish CPU profile summary
+        if: always()
+        env:
+          ARTIFACT_URL: ${{ steps.load-artifact.outputs.artifact-url }}
+          MODE: ${{ steps.revisions.outputs.mode }}
+          PROFILER_AVAILABLE: ${{ steps.profiler.outputs.available }}
+          PROFILE_BUILD_OUTCOME: ${{ steps.profile-build.outcome }}
+          PROFILE_RUN_OUTCOME: ${{ steps.cpu-profile.outcome }}
+          FLAMEGRAPH_URL: ${{ steps.flamegraph.outputs.artifact-url }}
+          BASELINE_FLAMEGRAPH_URL: ${{ steps.flamegraph-baseline.outputs.artifact-url }}
+          COMPARISON_FLAMEGRAPH_URL: ${{ steps.flamegraph-comparison.outputs.artifact-url }}
+        run: |
+          set -uo pipefail
+          mkdir -p artifacts
+
+          publish_profile() {
+            local reporter=$1
+            local input=$2
+            local heading=$3
+            local summary=$4
+            local flamegraph_url=$5
+            local args=(
+              report
+              --input "$input"
+              --output "$summary"
+            )
+            if [[ -n "$ARTIFACT_URL" ]]; then
+              args+=(--artifact-url "$ARTIFACT_URL")
+            fi
+            if [[ -n "$flamegraph_url" ]]; then
+              args+=(--flamegraph-url "$flamegraph_url")
+            fi
+            if [[ -x "$reporter" && -s "$input/profile.ready" ]] && \
+              "$reporter" "${args[@]}"; then
+              if [[ -n "$heading" ]]; then
+                {
+                  echo "$heading"
+                  echo
+                  tail -n +2 "$summary"
+                } >> "$GITHUB_STEP_SUMMARY"
+              else
+                cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+              fi
+              return
+            fi
+            {
+              echo "$heading"
+              echo
+              echo '| Profile | Profiler available | Build | Capture |'
+              echo '| --- | --- | --- | --- |'
+              echo "| UNAVAILABLE | ${PROFILER_AVAILABLE:-false} | ${PROFILE_BUILD_OUTCOME:-skipped} | ${PROFILE_RUN_OUTCOME:-skipped} |"
+              echo
+              echo 'The artifact retains profiler diagnostics when capture was attempted.'
+              echo
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          if [[ "$MODE" == comparison ]]; then
+            {
+              echo '# o-sfu CPU profiles'
+              echo
+            } >> "$GITHUB_STEP_SUMMARY"
+            publish_profile \
+              target/baseline/release/o-sfu-load-profile \
+              artifacts/profile/baseline/audio-1x28 \
+              '## Baseline revision' \
+              artifacts/profile-baseline-summary.md \
+              "$BASELINE_FLAMEGRAPH_URL"
+            publish_profile \
+              target/comparison/release/o-sfu-load-profile \
+              artifacts/profile/comparison/audio-1x28 \
+              '## Comparison revision' \
+              artifacts/profile-comparison-summary.md \
+              "$COMPARISON_FLAMEGRAPH_URL"
+          else
+            publish_profile \
+              target/release/o-sfu-load-profile \
+              artifacts/profile/audio-1x28 \
+              '# o-sfu CPU profile' \
+              artifacts/profile-summary.md \
+              "$FLAMEGRAPH_URL"
+          fi

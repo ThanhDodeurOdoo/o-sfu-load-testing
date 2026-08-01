@@ -90,9 +90,15 @@ target/release/o-sfu-load-report \
   --output artifacts/summary.md
 ```
 
-The report embeds native Mermaid charts for observed delivery rate, scheduled
-sender RTP payload versus receiver-observed payload plus SFU CPU average, peak
-and timeline data.
+The report embeds native Mermaid line charts for observed delivery rate,
+scheduled sender RTP payload versus receiver-observed payload plus SFU CPU
+average, peak and timeline data. Category charts contain at most four scenarios
+per panel and use compact labels. Scenarios within each workload family are
+ordered by planned load. Every panel declares its independent y-axis scale.
+The CPU timeline groups real samples into at most 32 equal elapsed-time buckets
+then applies a centered five-bucket moving average. The bucket count shrinks
+when needed so a scrape gap is not filled with invented data. Bucket values and
+the unsmoothed sampled peak remain in the report.
 Tables retain the authoritative counters, packet discrepancies and process
 metrics. Raw JSONL and logs remain available as workflow artifacts.
 
@@ -106,11 +112,42 @@ target/release/o-sfu-load-report \
 ```
 
 It requires identical scenario, profile, server policy and workload plans.
-Each Mermaid graph places adjacent `B` baseline and `C` comparison bars on one
+Each comparison graph draws baseline and comparison as two lines on one
 scenario axis. Tables show comparison-minus-baseline deltas beside exact
 delivery evidence. The report includes a label legend. For example
 `video-gallery-1x64-10p-60s` means one room with 64 peers, 10 video publishers
 per room and a 60 second workload.
+
+## CPU profiling
+
+The nightly workflow runs a separate 1-room by 28-peer audio replay after the
+ordinary measurements. Linux `perf` samples only the o-sfu process with the
+software `cpu-clock` event at a requested 99 Hz. The profiling server is
+rebuilt with debug information and forced frame pointers. The RTC generator
+remains a separate process on CPUs 1 through 3.
+
+`o-sfu-load-profile` collapses the captured stacks and uses
+[Inferno](https://github.com/jonhoo/inferno) to generate an interactive SVG
+flamegraph. The job summary reports thread share, kernel share, unresolved
+samples plus hottest leaf symbols, hottest inclusive frames and hottest
+complete stacks. Inclusive rows overlap by definition and must not be summed.
+The postprocessor expects `perf`, `inferno-collapse-perf` and
+`inferno-flamegraph` on `PATH`. The nightly workflow pins Inferno 0.12.8.
+
+The flamegraph, `perf.data`, folded stacks, profiled server binary and raw perf
+reports are retained in the workflow artifact. The profile summary also records
+the runner CPU model, logical CPU count, kernel, tool versions and maximum stack
+depth. GitHub Actions uploads a PNG flamegraph preview as an unarchived image
+artifact so the job summary embeds it directly for signed-in viewers. The
+complete artifact retains the interactive SVG, ranked breakdown and raw
+evidence. If the hosted runner denies
+performance-counter access then the ordinary load report remains valid and the
+profile section records that profiling was unavailable.
+
+Profiling is a qualitative diagnostic replay. Debug information plus frame
+pointers and sampling affect that replay so its timings are excluded from the
+authoritative nightly measurements. Manual revision comparisons profile both
+revisions after their ordinary scenarios have completed.
 
 ## GitHub Actions
 

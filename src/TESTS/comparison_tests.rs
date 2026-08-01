@@ -1,6 +1,6 @@
 use serde_json::json;
 
-use super::{Side, format_delta, render_sides};
+use super::{Side, format_delta, pair_runs, render_sides};
 use crate::{
     ScenarioResult, ScenarioSpec,
     report::{RunData, SampleSet, parse_samples},
@@ -10,7 +10,7 @@ const BASELINE_REVISION: &str = "1111111111111111111111111111111111111111";
 const COMPARISON_REVISION: &str = "2222222222222222222222222222222222222222";
 
 #[test]
-fn comparison_renders_adjacent_revision_bars_and_deltas() -> anyhow::Result<()> {
+fn comparison_renders_revision_lines_and_deltas() -> anyhow::Result<()> {
     let spec = ScenarioSpec::smoke(1, 50)?;
     let baseline = run(spec, BASELINE_REVISION, 1_000, 10)?.with_samples(samples(20, 50_000));
     let comparison = run(spec, COMPARISON_REVISION, 1_000, 5)?.with_samples(samples(15, 40_000));
@@ -23,9 +23,14 @@ fn comparison_renders_adjacent_revision_bars_and_deltas() -> anyhow::Result<()> 
     assert!(report.contains("| Scenario | Profile | Expected deliveries | Duration |"));
     assert!(!report.contains("| Scenario | Profile | Expected deliveries | Duration | Contract |"));
     assert!(report.contains("title \"Receiver delivery throughput\""));
-    assert!(report.contains("x-axis [\"B smoke 1r 50p\", \"C smoke 1r 50p\"]"));
-    assert!(report.contains("bar [50, 50]"));
-    assert!(!report.contains("    line ["));
+    assert!(report.contains("x-axis [\"S 1r/50p\", \"\"]"));
+    assert!(
+        report.contains(
+            "Series colors: Blue (`#388BFD`) = baseline. Orange (`#B86E00`) = comparison."
+        )
+    );
+    assert!(report.contains("    line [50, 50]\n    line [50, 50]"));
+    assert!(!report.contains("    bar ["));
     assert!(report.contains("title \"SFU CPU time per million deliveries\""));
     assert!(report.contains("2,000.000000 CPU s/1M"));
     assert!(report.contains("1,000.000000 CPU s/1M"));
@@ -36,7 +41,7 @@ fn comparison_renders_adjacent_revision_bars_and_deltas() -> anyhow::Result<()> 
 }
 
 #[test]
-fn comparison_chunks_more_than_six_scenario_pairs() -> anyhow::Result<()> {
+fn comparison_chunks_scenarios_before_labels_become_dense() -> anyhow::Result<()> {
     let mut baseline = Vec::new();
     let mut comparison = Vec::new();
     for receivers in 1..=7 {
@@ -49,7 +54,7 @@ fn comparison_chunks_more_than_six_scenario_pairs() -> anyhow::Result<()> {
 
     assert!(report.contains("title \"Receiver delivery throughput (1/2)\""));
     assert!(report.contains("title \"Receiver delivery throughput (2/2)\""));
-    assert!(report.contains("x-axis [\"B smoke 7r 50p\", \"C smoke 7r 50p\"]"));
+    assert!(report.contains("x-axis [\"S 5r/50p\", \"S 6r/50p\", \"S 7r/50p\"]"));
     Ok(())
 }
 
@@ -79,6 +84,26 @@ fn comparison_reports_missing_scenarios() -> anyhow::Result<()> {
     assert!(report.contains("smoke-1r-50p is missing from the comparison"));
     assert!(report.contains("smoke-2r-50p is missing from the baseline"));
     assert!(report.contains("No scenario pair was available for comparison."));
+    Ok(())
+}
+
+#[test]
+fn comparison_pairs_distinct_scenarios_with_the_same_rounded_rate() -> anyhow::Result<()> {
+    let first = ScenarioSpec::smoke(1, 52)?;
+    let second = ScenarioSpec::smoke(1, 53)?;
+    let baseline = vec![
+        run(first, BASELINE_REVISION, 1_000, 0)?,
+        run(second, BASELINE_REVISION, 1_000, 0)?,
+    ];
+    let comparison = vec![
+        run(first, COMPARISON_REVISION, 1_000, 0)?,
+        run(second, COMPARISON_REVISION, 1_000, 0)?,
+    ];
+
+    let pairing = pair_runs(&baseline, &comparison);
+
+    assert_eq!(pairing.pairs.len(), 2);
+    assert!(pairing.issues.is_empty());
     Ok(())
 }
 

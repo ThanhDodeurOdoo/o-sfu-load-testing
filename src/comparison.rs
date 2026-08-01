@@ -9,14 +9,12 @@ use std::{
 use anyhow::{Context, Result, ensure};
 
 use crate::report::{
-    ChartPlot, LoadFailure, MAX_CHART_SCENARIOS, MAX_INPUTS, RunData, TelemetrySummary,
-    chart_label, delivered_payload_bits_per_second, delivery_rate, ensure_summary_size,
-    escape_table, format_bits_per_second, format_cpu_percent, format_mebibytes,
-    format_milliseconds, load_run, pacing_valid, render_chart, render_scenario_legend,
-    scenario_key, scenario_label, validate_artifact_url, validate_run,
+    ChartSeries, LoadFailure, MAX_INPUTS, RunData, TelemetrySummary, chart_label,
+    delivered_payload_bits_per_second, delivery_rate, ensure_summary_size, escape_table,
+    format_bits_per_second, format_cpu_percent, format_mebibytes, format_milliseconds, load_run,
+    pacing_valid, render_category_charts, render_scenario_legend, scenario_key, scenario_label,
+    validate_artifact_url, validate_run,
 };
-
-const COMPARISON_SCENARIOS_PER_CHART: usize = MAX_CHART_SCENARIOS / 2;
 
 struct Side {
     runs: Vec<RunData>,
@@ -381,7 +379,7 @@ fn render_graphs(
     writeln!(output, "## Comparison graphs\n")?;
     writeln!(
         output,
-        "Every scenario uses adjacent `B` and `C` bars. `B` is baseline `{}`. `C` is comparison `{}`.\n",
+        "Every graph uses one scenario axis. The first line is baseline `{}`. The second line is comparison `{}`. Coincident lines mean both plotted values are equal and the tables retain both numbers.\n",
         short_revision(baseline_revision, "baseline"),
         short_revision(comparison_revision, "comparison")
     )?;
@@ -390,7 +388,7 @@ fn render_graphs(
 }
 
 fn render_delivery_graphs(output: &mut String, metrics: &[PairMetrics<'_>]) -> Result<()> {
-    render_paired_bars(
+    render_paired_lines(
         output,
         metrics,
         "Receiver delivery throughput",
@@ -403,7 +401,7 @@ fn render_delivery_graphs(output: &mut String, metrics: &[PairMetrics<'_>]) -> R
             )
         },
     )?;
-    render_paired_bars(
+    render_paired_lines(
         output,
         metrics,
         "Receiver-observed RTP payload",
@@ -420,7 +418,7 @@ fn render_delivery_graphs(output: &mut String, metrics: &[PairMetrics<'_>]) -> R
 }
 
 fn render_system_graphs(output: &mut String, metrics: &[PairMetrics<'_>]) -> Result<()> {
-    render_paired_bars(
+    render_paired_lines(
         output,
         metrics,
         "SFU CPU time per million deliveries",
@@ -439,7 +437,7 @@ fn render_system_graphs(output: &mut String, metrics: &[PairMetrics<'_>]) -> Res
             )
         },
     )?;
-    render_paired_bars(
+    render_paired_lines(
         output,
         metrics,
         "Generator send lag",
@@ -452,7 +450,7 @@ fn render_system_graphs(output: &mut String, metrics: &[PairMetrics<'_>]) -> Res
             )
         },
     )?;
-    render_paired_bars(
+    render_paired_lines(
         output,
         metrics,
         "SFU packet-loop delay",
@@ -465,7 +463,7 @@ fn render_system_graphs(output: &mut String, metrics: &[PairMetrics<'_>]) -> Res
             )
         },
     )?;
-    render_paired_bars(
+    render_paired_lines(
         output,
         metrics,
         "SFU average CPU",
@@ -478,7 +476,7 @@ fn render_system_graphs(output: &mut String, metrics: &[PairMetrics<'_>]) -> Res
             )
         },
     )?;
-    render_paired_bars(
+    render_paired_lines(
         output,
         metrics,
         "SFU peak resident memory",
@@ -494,7 +492,7 @@ fn render_system_graphs(output: &mut String, metrics: &[PairMetrics<'_>]) -> Res
     Ok(())
 }
 
-fn render_paired_bars<F>(
+fn render_paired_lines<F>(
     output: &mut String,
     metrics: &[PairMetrics<'_>],
     title: &str,
@@ -527,30 +525,36 @@ where
         writeln!(output, "The {title} graph has no paired data.\n")?;
         return Ok(());
     }
-    let chunk_count = paired.len().div_ceil(COMPARISON_SCENARIOS_PER_CHART);
-    for (index, chunk) in paired.chunks(COMPARISON_SCENARIOS_PER_CHART).enumerate() {
-        let mut labels = Vec::with_capacity(chunk.len() * 2);
-        let mut values = Vec::with_capacity(chunk.len() * 2);
-        for (label, baseline, comparison) in chunk {
-            labels.extend([format!("B {label}"), format!("C {label}")]);
-            values.extend([*baseline, *comparison]);
-        }
-        let chart_title = if chunk_count == 1 {
-            title.to_owned()
-        } else {
-            format!("{title} ({}/{chunk_count})", index + 1)
-        };
-        render_chart(
-            output,
-            &chart_title,
-            "Adjacent B and C bars compare both revisions on one scale.",
-            &labels,
-            y_axis,
-            minimum,
-            &[ChartPlot::Bar(&values)],
-        )?;
-    }
-    Ok(())
+    let labels = paired
+        .iter()
+        .map(|(label, _baseline, _comparison)| label.clone())
+        .collect::<Vec<_>>();
+    let baseline = paired
+        .iter()
+        .map(|(_label, baseline, _comparison)| *baseline)
+        .collect::<Vec<_>>();
+    let comparison = paired
+        .iter()
+        .map(|(_label, _baseline, comparison)| *comparison)
+        .collect::<Vec<_>>();
+    render_category_charts(
+        output,
+        title,
+        "Two lines compare both revisions on one scenario axis.",
+        &labels,
+        y_axis,
+        minimum,
+        &[
+            ChartSeries {
+                name: "baseline",
+                values: &baseline,
+            },
+            ChartSeries {
+                name: "comparison",
+                values: &comparison,
+            },
+        ],
+    )
 }
 
 fn render_performance_table(output: &mut String, metrics: &[PairMetrics<'_>]) -> Result<()> {

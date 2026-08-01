@@ -20,6 +20,8 @@ struct Cli {
     server_cpus: Option<String>,
     #[arg(long)]
     rtc_cpus: Option<String>,
+    #[arg(long)]
+    profile_server: bool,
     #[command(subcommand)]
     scenario: ScenarioCommand,
 }
@@ -75,6 +77,7 @@ async fn main() -> Result<()> {
         output_directory: cli.output,
         server_cpus: cli.server_cpus,
         rtc_cpus: cli.rtc_cpus,
+        profile_server: cli.profile_server,
         spec,
     })
     .await?;
