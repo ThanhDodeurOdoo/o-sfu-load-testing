@@ -594,9 +594,10 @@ fn format_packet_loop_health(summary: &TelemetrySummary) -> String {
 
 fn render_workloads(output: &mut String, runs: &[RunData]) -> Result<()> {
     writeln!(output, "## Workloads\n")?;
+    render_consumer_context(output)?;
     writeln!(
         output,
-        "| Exact | Scenario | Rooms | Peers/room | Publications/room | Streams | Routes | Offered packets | Expected deliveries | Duration | Max send lag | Pacing | Profile | Validation |"
+        "| Exact | Scenario | Rooms | Peers/room | Publications/room | Streams | Total media consumers | Offered packets | Expected deliveries | Duration | Max send lag | Pacing | Profile | Validation |"
     )?;
     writeln!(
         output,
@@ -625,6 +626,18 @@ fn render_workloads(output: &mut String, runs: &[RunData]) -> Result<()> {
         )?;
     }
     writeln!(output)?;
+    Ok(())
+}
+
+pub(crate) fn render_consumer_context(output: &mut String) -> Result<()> {
+    writeln!(
+        output,
+        "Reports count each simultaneous source-to-receiver forwarding relationship as one media consumer. Each audio or camera publication creates one consumer for every other peer in its room. Publishers do not consume their own publication. A two-RID simulcast camera remains one consumer per receiver because each receiver selects one RID.\n"
+    )?;
+    writeln!(
+        output,
+        "For example, 10 audio publishers among 60 total peers create `10 × (60 - 1) = 590` consumers. The count would be 600 only for 60 listeners separate from the 10 publishers. [mediasoup documents](https://mediasoup.org/documentation/v3/scalability/) that one single-core worker typically handles over roughly 500 consumers depending on host CPU capability. That figure is topology context, not a portable capacity threshold.\n"
+    )?;
     Ok(())
 }
 

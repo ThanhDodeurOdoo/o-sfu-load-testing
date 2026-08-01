@@ -12,8 +12,8 @@ use crate::report::{
     ChartSeries, LoadFailure, MAX_INPUTS, RunData, TelemetrySummary, chart_label,
     delivered_payload_bits_per_second, delivery_rate, ensure_summary_size, escape_table,
     format_bits_per_second, format_cpu_percent, format_mebibytes, format_milliseconds, load_run,
-    pacing_valid, render_category_charts, render_media_profile, render_scenario_legend,
-    scenario_key, scenario_label, validate_artifact_url, validate_run,
+    pacing_valid, render_category_charts, render_consumer_context, render_media_profile,
+    render_scenario_legend, scenario_key, scenario_label, validate_artifact_url, validate_run,
 };
 
 struct Side {
@@ -310,18 +310,20 @@ fn render_issues(
 
 fn render_workload_identity(output: &mut String, pairs: &[RunPair<'_>]) -> Result<()> {
     writeln!(output, "## Workload identity\n")?;
+    render_consumer_context(output)?;
     writeln!(
         output,
-        "| Scenario | Profile | Expected deliveries | Duration |"
+        "| Scenario | Profile | Total media consumers | Expected deliveries | Duration |"
     )?;
-    writeln!(output, "| --- | --- | ---: | ---: |")?;
+    writeln!(output, "| --- | --- | ---: | ---: | ---: |")?;
     for pair in pairs {
         let result = &pair.baseline.result;
         writeln!(
             output,
-            "| {} | {} | {} | {} s |",
+            "| {} | {} | {} | {} | {} s |",
             scenario_label(result.scenario),
             escape_table(&result.profile),
+            grouped(result.plan.routes),
             grouped(result.plan.expected_deliveries),
             result.scenario.duration_seconds()
         )?;

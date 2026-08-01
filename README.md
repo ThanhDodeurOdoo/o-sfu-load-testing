@@ -29,6 +29,20 @@ one remote camera as featured when available and receives other cameras as
 thumbnails. Mixed publishers use deterministic phase offsets within each media
 interval so independent sources do not form synchronized sender bursts.
 
+Reports count each simultaneous source-to-receiver forwarding relationship as
+one media consumer. Each audio or camera publication creates one consumer for
+every other peer in its room. Publishers do not consume their own publication.
+A two-RID simulcast camera remains one consumer per receiver because each
+receiver selects one RID. For example, 10 audio publishers among 60 total peers
+create `10 × (60 - 1) = 590` consumers. The count would be 600 only for 60
+listeners separate from the 10 publishers.
+
+[mediasoup documents](https://mediasoup.org/documentation/v3/scalability/)
+that one single-core worker typically handles over roughly 500 consumers
+depending on host CPU capability. This is topology context rather than a
+portable capacity threshold. CPU, media rates, packets per second and protocol
+work all affect the actual limit.
+
 ### Media units
 
 The fixed sizes approximate average active-media output. They are deterministic
@@ -162,11 +176,11 @@ per room and a 60 second workload.
 
 ## CPU profiling
 
-The nightly workflow profiles the passing 28-peer audio workload after the
-ordinary measurements. Linux `perf` samples only the o-sfu process with the
-software `cpu-clock` event at a requested 99 Hz. The profiling server is rebuilt
-with debug information and forced frame pointers. The RTC generator remains a
-separate process on CPUs 1 through 3.
+The nightly workflow profiles the passing 28-peer audio workload with 756 total
+media consumers after the ordinary measurements. Linux `perf` samples only the
+o-sfu process with the software `cpu-clock` event at a requested 99 Hz. The
+profiling server is rebuilt with debug information and forced frame pointers.
+The RTC generator remains a separate process on CPUs 1 through 3.
 
 `o-sfu-load-profile` collapses the captured stacks and uses
 [Inferno](https://github.com/jonhoo/inferno) to generate an interactive SVG
@@ -199,20 +213,20 @@ revisions after their ordinary scenarios have completed.
 CI runs the bounded smoke. The nightly workflow runs these fixed profiles
 using four assigned logical CPUs:
 
-| Profile | Role | Publications/room | Consumers/source | Deliveries/s | Exact deliveries |
-| --- | --- | ---: | ---: | ---: | ---: |
-| 1 room × 8 audio peers × 30 s | Exact gate | 8 | 7 | 2,800 | 84,000 |
-| 2 rooms × 12 audio peers × 60 s | Exact gate | 12 | 11 | 13,200 | 792,000 |
-| 3 rooms × 12 audio peers × 120 s | Exact gate | 12 | 11 | 19,800 | 2,376,000 |
-| 1 room × 28 audio peers × 120 s | Exact gate | 28 | 27 | 37,800 | 4,536,000 |
-| 1 room × 12 peers × 4 cameras × 30 s | Exact gate | 4 | 11 | 6,052 | 181,560 |
-| 1 room × 64 peers × 10 cameras × 60 s | Exact gate | 10 | 63 | 44,335 | 2,660,100 |
+| Profile | Role | Publications/room | Consumers/source | Total media consumers | Deliveries/s | Exact deliveries |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 1 room × 8 audio peers × 30 s | Exact gate | 8 | 7 | 56 | 2,800 | 84,000 |
+| 2 rooms × 12 audio peers × 60 s | Exact gate | 12 | 11 | 264 | 13,200 | 792,000 |
+| 3 rooms × 12 audio peers × 120 s | Exact gate | 12 | 11 | 396 | 19,800 | 2,376,000 |
+| 1 room × 28 audio peers × 120 s | Exact gate | 28 | 27 | 756 | 37,800 | 4,536,000 |
+| 1 room × 12 peers × 4 cameras × 30 s | Exact gate | 4 | 11 | 44 | 6,052 | 181,560 |
+| 1 room × 64 peers × 10 cameras × 60 s | Exact gate | 10 | 63 | 630 | 44,335 | 2,660,100 |
 
-The 28-peer audio room exercises 756 simultaneous source-to-receiver routes.
-The 64-peer video room exercises 10 simulcast publishers and 630 selected
-source-to-receiver routes. The six profiles gate 10,629,660 exact forwarded
-deliveries. Their job summary renders the graphs directly without requiring an
-artifact download. Artifacts retain the detailed evidence.
+The 28-peer audio room exercises 756 total media consumers. The 64-peer video
+room exercises 10 simulcast publishers and 630 total media consumers. The six
+profiles gate 10,629,660 exact forwarded deliveries. Their job summary renders
+the graphs directly without requiring an artifact download. Artifacts retain
+the detailed evidence.
 
 Scheduled runs and manual runs without comparison inputs keep the ordinary
 single-version behavior. A manual comparison accepts `comparison_revision` as

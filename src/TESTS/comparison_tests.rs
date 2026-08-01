@@ -20,8 +20,12 @@ fn comparison_renders_revision_lines_and_deltas() -> anyhow::Result<()> {
     assert!(report.contains("| PASS | IDENTICAL | VALID | VALID | 1 | 0 |"));
     assert!(report.contains(BASELINE_REVISION));
     assert!(report.contains(COMPARISON_REVISION));
-    assert!(report.contains("| Scenario | Profile | Expected deliveries | Duration |"));
-    assert!(!report.contains("| Scenario | Profile | Expected deliveries | Duration | Contract |"));
+    assert!(report.contains(
+        "| Scenario | Profile | Total media consumers | Expected deliveries | Duration |"
+    ));
+    assert!(!report.contains(
+        "| Scenario | Profile | Total media consumers | Expected deliveries | Duration | Contract |"
+    ));
     assert!(report.contains(
         "The Receiver delivery throughput chart is omitted because fewer than two scenarios have chartable values. The tabular metrics remain available."
     ));
@@ -48,7 +52,7 @@ fn comparison_pairs_mixed_conference_contracts() -> anyhow::Result<()> {
 
     assert!(report.contains("| PASS | IDENTICAL | VALID | INVALID | 1 | 0 |"));
     assert!(report.contains(
-        "| mixed-conference-1x20-5a-4v-10s | opus-vp8-mixed-conference-v1 | 149,180 | 10 s |"
+        "| mixed-conference-1x20-5a-4v-10s | opus-vp8-mixed-conference-v1 | 171 | 149,180 | 10 s |"
     ));
     assert!(report.contains("## Per-stream media load"));
     Ok(())
@@ -83,7 +87,7 @@ fn comparison_rejects_workload_contract_mismatch() -> anyhow::Result<()> {
 
     assert!(report.contains("| FAIL | MISMATCH | VALID | INVALID |"));
     assert!(report.contains("smoke-1r-50p has different workload contracts"));
-    assert!(report.contains("| smoke-1r-50p | opus-fanout-smoke-v3 | 50 | 1 s |"));
+    assert!(report.contains("| smoke-1r-50p | opus-fanout-smoke-v3 | 1 | 50 | 1 s |"));
     assert!(!report.contains("```mermaid"));
     Ok(())
 }

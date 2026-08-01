@@ -187,7 +187,8 @@ fn profile_summary_explains_overlapping_costs_and_raw_evidence() -> anyhow::Resu
     let flamegraph_url = "https://github.com/example/repo/releases/download/load-test-assets/o-sfu-flamegraph-1-1.png";
     let summary = super::render(&directory, Some(artifact_url), Some(flamegraph_url))?;
 
-    assert!(summary.contains("| AVAILABLE | PASS | audio-mesh-1x28-120s |"));
+    assert!(summary.contains("| Scenario | Total media consumers | o-sfu revision |"));
+    assert!(summary.contains("| AVAILABLE | PASS | audio-mesh-1x28-120s | 756 |"));
     assert!(summary.contains("| cpu-clock | fp | 99 Hz | 2.500 s | 100 | 10 (10.00%) |"));
     assert!(summary.contains("| CPU model | Example CPU |"));
     assert!(summary.contains("| Maximum stack depth | 127 |"));

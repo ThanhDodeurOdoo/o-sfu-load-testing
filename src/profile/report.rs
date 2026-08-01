@@ -303,21 +303,22 @@ fn render_overview(
     writeln!(output, "# o-sfu CPU profile\n")?;
     writeln!(
         output,
-        "| Profile | Exact RTC work | Scenario | o-sfu revision | Event | Unwind | Requested frequency | Capture | Samples | Unresolved leaf |"
+        "| Profile | Exact RTC work | Scenario | Total media consumers | o-sfu revision | Event | Unwind | Requested frequency | Capture | Samples | Unresolved leaf |"
     )?;
     writeln!(
         output,
-        "| --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: |"
+        "| --- | --- | --- | ---: | --- | --- | --- | ---: | ---: | ---: | ---: |"
     )?;
     writeln!(
         output,
-        "| {} | PASS | {} | {} | {} | {} | {} Hz | {} | {} | {} |\n",
+        "| {} | PASS | {} | {} | {} | {} | {} | {} Hz | {} | {} | {} |\n",
         if report.profile.malformed_lines == 0 {
             "AVAILABLE"
         } else {
             "INCOMPLETE"
         },
         scenario_label(report.run.result.scenario),
+        grouped(report.run.result.plan.routes),
         escape_table(report.run.result.o_sfu_revision.as_deref().unwrap_or("n/a")),
         escape_table(&report.capture.event),
         escape_table(&report.capture.call_graph),
