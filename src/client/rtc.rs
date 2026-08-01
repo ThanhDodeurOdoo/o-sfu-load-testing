@@ -2,6 +2,7 @@ use std::{
     collections::VecDeque,
     io::ErrorKind,
     net::SocketAddr,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -33,7 +34,7 @@ pub struct RtcPeer {
     audio_send_mid: Option<Mid>,
     video_upload_slot: Option<NegotiationUploadSlot>,
     declared_streams: DeclaredStreams,
-    pending_rtp: VecDeque<Vec<u8>>,
+    pending_rtp: VecDeque<Arc<[u8]>>,
     next_timeout: Instant,
     send_origin: Option<Instant>,
 }
@@ -202,7 +203,10 @@ impl RtcPeer {
         Ok(payload_len)
     }
 
-    pub async fn read_rtp_payload(&mut self, timeout_window: Duration) -> Result<Option<Vec<u8>>> {
+    pub async fn read_rtp_payload(
+        &mut self,
+        timeout_window: Duration,
+    ) -> Result<Option<Arc<[u8]>>> {
         if let Some(payload) = self.pending_rtp.pop_front() {
             return Ok(Some(payload));
         }
@@ -226,6 +230,10 @@ impl RtcPeer {
 
     pub(super) fn reset_send_pacing(&mut self) {
         self.send_origin = None;
+    }
+
+    pub(super) fn set_send_origin(&mut self, send_origin: Instant) {
+        self.send_origin = Some(send_origin);
     }
 
     async fn pace_until(&mut self, emitted_at: Duration) -> Result<Instant> {
@@ -321,7 +329,7 @@ impl RtcPeer {
                 }
             }
             Event::RtpPacket(packet) => {
-                self.pending_rtp.push_back(packet.payload.as_ref().to_vec());
+                self.pending_rtp.push_back(packet.payload);
             }
             _ => {}
         }

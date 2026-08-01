@@ -183,29 +183,35 @@ jobs:
             local target_directory=$1
             local output=$2
             shift 2
-            "$target_directory/release/o-sfu-load" \
+            if ! "$target_directory/release/o-sfu-load" \
               --server-binary "$target_directory/release/o-sfu-load-server" \
               --rtc-binary "$target_directory/release/o-sfu-load-rtc" \
               --server-cpus 0 \
               --rtc-cpus 1-3 \
               --output "$output" \
-              "$@" || status=1
+              "$@"; then
+              status=1
+              return 1
+            fi
           }
 
           run_profiles() {
             local run_profile=$1
             "$run_profile" audio-1x8 \
-              audio-mesh --rooms 1 --peers 8 --seconds 30
+              audio-mesh --rooms 1 --peers 8 --seconds 30 || return 1
             "$run_profile" audio-2x12 \
-              audio-mesh --rooms 2 --peers 12 --seconds 60
+              audio-mesh --rooms 2 --peers 12 --seconds 60 || return 1
             "$run_profile" audio-3x12 \
-              audio-mesh --rooms 3 --peers 12 --seconds 120
+              audio-mesh --rooms 3 --peers 12 --seconds 120 || return 1
             "$run_profile" audio-1x28 \
-              audio-mesh --rooms 1 --peers 28 --seconds 120
+              audio-mesh --rooms 1 --peers 28 --seconds 120 || return 1
             "$run_profile" video-1x12 \
-              video-gallery --rooms 1 --peers 12 --publishers 4 --seconds 30
+              video-gallery --rooms 1 --peers 12 --publishers 4 --seconds 30 || return 1
             "$run_profile" video-1x64 \
-              video-gallery --rooms 1 --peers 64 --publishers 10 --seconds 60
+              video-gallery --rooms 1 --peers 64 --publishers 10 --seconds 60 || return 1
+            "$run_profile" mixed-1x100 \
+              mixed-conference --rooms 1 --peers 100 \
+                --audio-publishers 10 --video-publishers 9 --seconds 60 || return 1
           }
 
           run_single_profile() {
@@ -217,14 +223,14 @@ jobs:
           run_comparison_profile() {
             local name=$1
             shift
-            run_load target/baseline "artifacts/baseline/$name" "$@"
+            run_load target/baseline "artifacts/baseline/$name" "$@" || return 1
             run_load target/comparison "artifacts/comparison/$name" "$@"
           }
 
           if [[ "$MODE" == single ]]; then
-            run_profiles run_single_profile
+            run_profiles run_single_profile || status=1
           else
-            run_profiles run_comparison_profile
+            run_profiles run_comparison_profile || status=1
           fi
 
           exit "$status"
@@ -401,7 +407,9 @@ jobs:
               --rtc-cpus 1-3 \
               --profile-server \
               --output "$output" \
-              audio-mesh --rooms 1 --peers 28 --seconds 120 || return 1
+              mixed-conference --rooms 1 --peers 100 \
+                --audio-publishers 10 --video-publishers 9 \
+                --seconds 60 || return 1
             "$run_directory/release/o-sfu-load-profile" \
               prepare --input "$output" || return 1
           }
@@ -436,27 +444,27 @@ jobs:
 
           if [[ "$MODE" == single ]]; then
             capture_with_log target target/profile \
-              artifacts/profile/audio-1x28 Cargo.lock || status=1
-            if [[ -s artifacts/profile/audio-1x28/profile.ready ]]; then
+              artifacts/profile/mixed-1x100 Cargo.lock || status=1
+            if [[ -s artifacts/profile/mixed-1x100/profile.ready ]]; then
               render_preview \
-                artifacts/profile/audio-1x28/flamegraph.svg \
+                artifacts/profile/mixed-1x100/flamegraph.svg \
                 artifacts/o-sfu-flamegraph.png || status=1
             fi
           else
             capture_with_log target/baseline target/profile-baseline \
-              artifacts/profile/baseline/audio-1x28 \
+              artifacts/profile/baseline/mixed-1x100 \
               artifacts/baseline/Cargo.lock || status=1
             capture_with_log target/comparison target/profile-comparison \
-              artifacts/profile/comparison/audio-1x28 \
+              artifacts/profile/comparison/mixed-1x100 \
               artifacts/comparison/Cargo.lock || status=1
-            if [[ -s artifacts/profile/baseline/audio-1x28/profile.ready ]]; then
+            if [[ -s artifacts/profile/baseline/mixed-1x100/profile.ready ]]; then
               render_preview \
-                artifacts/profile/baseline/audio-1x28/flamegraph.svg \
+                artifacts/profile/baseline/mixed-1x100/flamegraph.svg \
                 artifacts/o-sfu-flamegraph-baseline.png || status=1
             fi
-            if [[ -s artifacts/profile/comparison/audio-1x28/profile.ready ]]; then
+            if [[ -s artifacts/profile/comparison/mixed-1x100/profile.ready ]]; then
               render_preview \
-                artifacts/profile/comparison/audio-1x28/flamegraph.svg \
+                artifacts/profile/comparison/mixed-1x100/flamegraph.svg \
                 artifacts/o-sfu-flamegraph-comparison.png || status=1
             fi
           fi
@@ -498,12 +506,14 @@ jobs:
                 --baseline-input artifacts/baseline/audio-1x28
                 --baseline-input artifacts/baseline/video-1x12
                 --baseline-input artifacts/baseline/video-1x64
+                --baseline-input artifacts/baseline/mixed-1x100
                 --comparison-input artifacts/comparison/audio-1x8
                 --comparison-input artifacts/comparison/audio-2x12
                 --comparison-input artifacts/comparison/audio-3x12
                 --comparison-input artifacts/comparison/audio-1x28
                 --comparison-input artifacts/comparison/video-1x12
                 --comparison-input artifacts/comparison/video-1x64
+                --comparison-input artifacts/comparison/mixed-1x100
                 --output "$summary"
               )
             else
@@ -514,6 +524,7 @@ jobs:
                 --input artifacts/audio-1x28
                 --input artifacts/video-1x12
                 --input artifacts/video-1x64
+                --input artifacts/mixed-1x100
                 --output "$summary"
               )
             fi
@@ -620,20 +631,20 @@ jobs:
             } >> "$publication"
             publish_profile \
               target/baseline/release/o-sfu-load-profile \
-              artifacts/profile/baseline/audio-1x28 \
+              artifacts/profile/baseline/mixed-1x100 \
               '## Baseline revision' \
               artifacts/profile-baseline-summary.md \
               "$baseline_url"
             publish_profile \
               target/comparison/release/o-sfu-load-profile \
-              artifacts/profile/comparison/audio-1x28 \
+              artifacts/profile/comparison/mixed-1x100 \
               '## Comparison revision' \
               artifacts/profile-comparison-summary.md \
               "$comparison_url"
           else
             publish_profile \
               target/release/o-sfu-load-profile \
-              artifacts/profile/audio-1x28 \
+              artifacts/profile/mixed-1x100 \
               '# o-sfu CPU profile' \
               artifacts/profile-summary.md \
               "$single_url"

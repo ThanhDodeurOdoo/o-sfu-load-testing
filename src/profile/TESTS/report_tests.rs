@@ -114,7 +114,7 @@ fn profile_summary_explains_overlapping_costs_and_raw_evidence() -> anyhow::Resu
     let scenario = crate::ScenarioSpec::smoke(1, 50)?;
     let plan = scenario.plan()?;
     let result = json!({
-        "schemaVersion": 3,
+        "schemaVersion": 4,
         "profile": scenario.profile(),
         "oSfuRevision": "1111111111111111111111111111111111111111",
         "scenario": scenario,

@@ -32,8 +32,10 @@ use crate::{
 };
 
 const PACKET_TIMEOUT: Duration = Duration::from_secs(10);
+const OPPORTUNISTIC_DRAIN_LIMIT: usize = 64;
 const QUIESCENCE_TIMEOUT: Duration = Duration::from_millis(200);
 const ROUTE_SETTLE_TIME: Duration = Duration::from_millis(300);
+const MEASURE_START_LEAD: Duration = Duration::from_secs(1);
 const WARMUP_AUDIO_PACKETS: u32 = 5;
 const WARMUP_VIDEO_FRAMES: u32 = 2;
 
@@ -117,6 +119,25 @@ pub async fn run(
                     )
                     .await
                 }
+                ScenarioSpec::MixedConference {
+                    peers,
+                    audio_publishers,
+                    video_publishers,
+                    seconds,
+                    ..
+                } => {
+                    run_mixed_room(
+                        &websocket_url,
+                        &room_id,
+                        peers,
+                        audio_publishers,
+                        video_publishers,
+                        seconds,
+                        room_index,
+                        sync,
+                    )
+                    .await
+                }
             }
             .with_context(|| format!("load room {room_index} failed"))
         });
@@ -153,22 +174,17 @@ async fn run_audio_room(
     for (peer_index, peer) in peers.into_iter().enumerate() {
         let peer_source = source_id(room_index, peer_count, peer_index)?;
         let source = (peer_index < publisher_count_usize).then(|| AudioSource::new(peer_source));
-        let mut expected = Vec::with_capacity(publisher_count_usize.saturating_sub(1));
-        for source_index in 0..publisher_count {
-            let source_index_usize =
-                usize::try_from(source_index).context("audio source index exceeds usize")?;
-            if source_index_usize != peer_index {
-                expected.push(ExpectedStream::audio(
-                    source_id(room_index, peer_count, source_index_usize)?,
-                    packet_count,
-                )?);
-            }
-        }
-        tasks.spawn(run_audio_peer(
-            peer,
-            source,
-            PacketLedger::new(expected),
+        let expected = expected_audio_streams(
+            room_index,
+            peer_count,
+            publisher_count,
+            peer_index,
             packet_count,
+        )?;
+        tasks.spawn(run_media_peer(
+            peer,
+            PeerMedia::audio(source, packet_count),
+            PacketLedger::new(expected),
             sync.clone(),
         ));
     }
@@ -201,49 +217,170 @@ async fn run_video_room(
     for (peer_index, peer) in peers.into_iter().enumerate() {
         let peer_source = source_id(room_index, peer_count, peer_index)?;
         let source = (peer_index < publisher_count_usize).then(|| VideoSource::new(peer_source));
-        let featured = featured_source(peer_index, publisher_count);
-        let mut expected = Vec::new();
-        for source_index in 0..publisher_count {
-            let source_index_usize =
-                usize::try_from(source_index).context("video source index exceeds usize")?;
-            if source_index_usize == peer_index {
-                continue;
-            }
-            let layer = if featured == Some(source_index) {
-                VideoLayer::High
-            } else {
-                VideoLayer::Low
-            };
-            let packet_count = match layer {
-                VideoLayer::Low => low_packets,
-                VideoLayer::High => high_packets,
-            };
-            expected.push(ExpectedStream::video(
-                source_id(room_index, peer_count, source_index_usize)?,
-                layer,
-                u32::try_from(packet_count).context("video packet count exceeds u32")?,
-            )?);
-        }
-        tasks.spawn(run_video_peer(
+        let expected = expected_video_streams(
+            room_index,
+            peer_count,
+            publisher_count,
+            peer_index,
+            low_packets,
+            high_packets,
+        )?;
+        tasks.spawn(run_media_peer(
             peer,
-            source,
+            PeerMedia::video(source, frame_count),
             PacketLedger::new(expected),
-            frame_count,
             sync.clone(),
         ));
     }
     collect_peer_observations(tasks).await
 }
 
-async fn run_audio_peer(
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the room topology and fixed media duration are independent scenario coordinates"
+)]
+async fn run_mixed_room(
+    websocket_url: &str,
+    room_id: &str,
+    peer_count: u32,
+    audio_publisher_count: u32,
+    video_publisher_count: u32,
+    seconds: u32,
+    room_index: u32,
+    sync: ScenarioSync,
+) -> Result<RunObservation> {
+    let mut peers = connect_peers(websocket_url, room_id, peer_count).await?;
+    configure_video_layouts(&mut peers, video_publisher_count).await?;
+    publish_sources(&mut peers, audio_publisher_count, PublishedKind::Audio).await?;
+    publish_sources(&mut peers, video_publisher_count, PublishedKind::Camera).await?;
+    let peers = peers
+        .into_iter()
+        .map(ProtocolPeer::into_load_peer)
+        .collect::<Result<Vec<_>>>()?;
+    let audio_packet_count = seconds
+        .checked_mul(AUDIO_PACKETS_PER_SECOND)
+        .context("audio packet count exceeds u32")?;
+    let video_frame_count = seconds
+        .checked_mul(VIDEO_FRAMES_PER_SECOND)
+        .context("video frame count exceeds u32")?;
+    let (low_packets, high_packets) = video_packets_per_layer(seconds)?;
+    let audio_publisher_count_usize =
+        usize::try_from(audio_publisher_count).context("audio publisher count exceeds usize")?;
+    let video_publisher_count_usize =
+        usize::try_from(video_publisher_count).context("video publisher count exceeds usize")?;
+    let mut tasks = JoinSet::new();
+    for (peer_index, peer) in peers.into_iter().enumerate() {
+        let peer_source = source_id(room_index, peer_count, peer_index)?;
+        let source_index = u32::try_from(peer_index).context("peer index exceeds u32")?;
+        let audio = (peer_index < audio_publisher_count_usize)
+            .then(|| AudioSource::staggered(peer_source, source_index, audio_publisher_count));
+        let video = (peer_index < video_publisher_count_usize)
+            .then(|| VideoSource::staggered(peer_source, source_index, video_publisher_count));
+        let mut expected = expected_audio_streams(
+            room_index,
+            peer_count,
+            audio_publisher_count,
+            peer_index,
+            audio_packet_count,
+        )?;
+        expected.extend(expected_video_streams(
+            room_index,
+            peer_count,
+            video_publisher_count,
+            peer_index,
+            low_packets,
+            high_packets,
+        )?);
+        tasks.spawn(run_media_peer(
+            peer,
+            PeerMedia::mixed(audio, audio_packet_count, video, video_frame_count),
+            PacketLedger::new(expected),
+            sync.clone(),
+        ));
+    }
+    collect_peer_observations(tasks).await
+}
+
+struct PeerMedia {
+    audio: Option<AudioSource>,
+    audio_packet_count: u32,
+    video: Option<VideoSource>,
+    video_frame_count: u32,
+}
+
+impl PeerMedia {
+    const fn audio(source: Option<AudioSource>, packet_count: u32) -> Self {
+        Self::mixed(source, packet_count, None, 0)
+    }
+
+    const fn video(source: Option<VideoSource>, frame_count: u32) -> Self {
+        Self::mixed(None, 0, source, frame_count)
+    }
+
+    const fn mixed(
+        audio: Option<AudioSource>,
+        audio_packet_count: u32,
+        video: Option<VideoSource>,
+        video_frame_count: u32,
+    ) -> Self {
+        Self {
+            audio,
+            audio_packet_count,
+            video,
+            video_frame_count,
+        }
+    }
+
+    fn target_duration(&self) -> Duration {
+        AUDIO_FRAME_INTERVAL
+            .saturating_mul(self.audio_packet_count)
+            .max(VIDEO_FRAME_INTERVAL.saturating_mul(self.video_frame_count))
+    }
+
+    fn reset_timelines(&mut self) {
+        if let Some(source) = self.audio.as_mut() {
+            source.reset_timeline();
+        }
+        if let Some(source) = self.video.as_mut() {
+            source.reset_timeline();
+        }
+    }
+
+    fn next_turn(&self, audio_ordinal: u32, video_frame: u32) -> Option<MediaTurn> {
+        let audio_due = self
+            .audio
+            .as_ref()
+            .filter(|_source| audio_ordinal < self.audio_packet_count)
+            .map(AudioSource::next_emitted_at);
+        let video_due = self
+            .video
+            .as_ref()
+            .filter(|_source| video_frame < self.video_frame_count)
+            .map(VideoSource::next_emitted_at);
+        match (audio_due, video_due) {
+            (Some(audio), Some(video)) if audio <= video => Some(MediaTurn::Audio),
+            (Some(_), Some(_)) => Some(MediaTurn::Video),
+            (Some(_), None) => Some(MediaTurn::Audio),
+            (None, Some(_)) => Some(MediaTurn::Video),
+            (None, None) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaTurn {
+    Audio,
+    Video,
+}
+
+async fn run_media_peer(
     mut peer: LoadPeer,
-    mut source: Option<AudioSource>,
+    mut media: PeerMedia,
     mut ledger: PacketLedger,
-    packet_count: u32,
     sync: ScenarioSync,
 ) -> Result<RunObservation> {
     sync.barrier.wait().await;
-    if let Some(source) = source.as_mut() {
+    if let Some(source) = media.audio.as_mut() {
         for ordinal in 0..WARMUP_AUDIO_PACKETS {
             let _payload_len = peer
                 .send_audio_packet(source.next_packet(PacketPhase::Warmup, ordinal))
@@ -251,54 +388,7 @@ async fn run_audio_peer(
             drain_pending(&mut peer, &mut ledger).await?;
         }
     }
-    drain_for(&mut peer, &mut ledger, ROUTE_SETTLE_TIME).await?;
-    sync.barrier.wait().await;
-    if let Some(source) = source.as_mut() {
-        source.reset_timeline();
-    }
-    peer.reset_send_pacing();
-    sync.barrier.wait().await;
-    let started_at = *sync.measured_at.get_or_init(Instant::now);
-    let target_duration = AUDIO_FRAME_INTERVAL.saturating_mul(packet_count);
-    let deadline = started_at + target_duration + PACKET_TIMEOUT;
-    let mut observation = RunObservation::default();
-    if let Some(source) = source.as_mut() {
-        for ordinal in 0..packet_count {
-            let packet = source.next_packet(PacketPhase::Measured, ordinal);
-            let emitted_at = packet.emitted_at;
-            let payload_len = peer.send_audio_packet(packet).await?;
-            observation.offered_packets = observation.offered_packets.saturating_add(1);
-            observation.offered_payload_bytes = observation
-                .offered_payload_bytes
-                .saturating_add(u64::try_from(payload_len).unwrap_or(u64::MAX));
-            observation.max_send_lag_ms = observation.max_send_lag_ms.max(elapsed_millis(
-                Instant::now().saturating_duration_since(started_at + emitted_at),
-            ));
-            drain_pending(&mut peer, &mut ledger).await?;
-        }
-    }
-    receive_until_complete(&mut peer, &mut ledger, deadline).await?;
-    let completed_at = Instant::now();
-    sync.barrier.wait().await;
-    drain_for(&mut peer, &mut ledger, QUIESCENCE_TIMEOUT).await?;
-    observation.elapsed_ms =
-        elapsed_millis_ceil(completed_at.duration_since(started_at).max(target_duration)).max(1);
-    observation.delivered_packets = ledger.delivered_packets;
-    observation.delivered_payload_bytes = ledger.delivered_payload_bytes;
-    observation.correctness = ledger.finish();
-    peer.close().await?;
-    Ok(observation)
-}
-
-async fn run_video_peer(
-    mut peer: LoadPeer,
-    mut source: Option<VideoSource>,
-    mut ledger: PacketLedger,
-    frame_count: u32,
-    sync: ScenarioSync,
-) -> Result<RunObservation> {
-    sync.barrier.wait().await;
-    if let Some(source) = source.as_mut() {
+    if let Some(source) = media.video.as_mut() {
         for frame in 0..WARMUP_VIDEO_FRAMES {
             for packet in source.next_frame(PacketPhase::Warmup, frame) {
                 let _payload_len = peer.send_video_packet(packet).await?;
@@ -308,28 +398,39 @@ async fn run_video_peer(
     }
     drain_for(&mut peer, &mut ledger, ROUTE_SETTLE_TIME).await?;
     sync.barrier.wait().await;
-    if let Some(source) = source.as_mut() {
-        source.reset_timeline();
-    }
+    media.reset_timelines();
     peer.reset_send_pacing();
     sync.barrier.wait().await;
-    let started_at = *sync.measured_at.get_or_init(Instant::now);
-    let target_duration = VIDEO_FRAME_INTERVAL.saturating_mul(frame_count);
+    let started_at = *sync
+        .measured_at
+        .get_or_init(|| Instant::now() + MEASURE_START_LEAD);
+    peer.set_send_origin(started_at.into_std());
+    sync.barrier.wait().await;
+    let target_duration = media.target_duration();
     let deadline = started_at + target_duration + PACKET_TIMEOUT;
     let mut observation = RunObservation::default();
-    if let Some(source) = source.as_mut() {
-        for frame in 0..frame_count {
-            for packet in source.next_frame(PacketPhase::Measured, frame) {
+    let mut audio_ordinal = 0;
+    let mut video_frame = 0;
+    while let Some(turn) = media.next_turn(audio_ordinal, video_frame) {
+        match turn {
+            MediaTurn::Audio => {
+                let source = media.audio.as_mut().context("audio source is missing")?;
+                let packet = source.next_packet(PacketPhase::Measured, audio_ordinal);
                 let emitted_at = packet.emitted_at;
-                let payload_len = peer.send_video_packet(packet).await?;
-                observation.offered_packets = observation.offered_packets.saturating_add(1);
-                observation.offered_payload_bytes = observation
-                    .offered_payload_bytes
-                    .saturating_add(u64::try_from(payload_len).unwrap_or(u64::MAX));
-                observation.max_send_lag_ms = observation.max_send_lag_ms.max(elapsed_millis(
-                    Instant::now().saturating_duration_since(started_at + emitted_at),
-                ));
+                let payload_len = peer.send_audio_packet(packet).await?;
+                observe_send(&mut observation, payload_len, started_at, emitted_at);
                 drain_pending(&mut peer, &mut ledger).await?;
+                audio_ordinal = audio_ordinal.saturating_add(1);
+            }
+            MediaTurn::Video => {
+                let source = media.video.as_mut().context("video source is missing")?;
+                for packet in source.next_frame(PacketPhase::Measured, video_frame) {
+                    let emitted_at = packet.emitted_at;
+                    let payload_len = peer.send_video_packet(packet).await?;
+                    observe_send(&mut observation, payload_len, started_at, emitted_at);
+                    drain_pending(&mut peer, &mut ledger).await?;
+                }
+                video_frame = video_frame.saturating_add(1);
             }
         }
     }
@@ -344,6 +445,21 @@ async fn run_video_peer(
     observation.correctness = ledger.finish();
     peer.close().await?;
     Ok(observation)
+}
+
+fn observe_send(
+    observation: &mut RunObservation,
+    payload_len: usize,
+    started_at: Instant,
+    emitted_at: Duration,
+) {
+    observation.offered_packets = observation.offered_packets.saturating_add(1);
+    observation.offered_payload_bytes = observation
+        .offered_payload_bytes
+        .saturating_add(u64::try_from(payload_len).unwrap_or(u64::MAX));
+    observation.max_send_lag_ms = observation.max_send_lag_ms.max(elapsed_millis(
+        Instant::now().saturating_duration_since(started_at + emitted_at),
+    ));
 }
 
 async fn collect_peer_observations(
@@ -427,6 +543,63 @@ async fn configure_video_layouts(peers: &mut [ProtocolPeer], publisher_count: u3
         peer.set_camera_layouts(layouts).await?;
     }
     Ok(())
+}
+
+fn expected_audio_streams(
+    room_index: u32,
+    peer_count: u32,
+    publisher_count: u32,
+    peer_index: usize,
+    packet_count: u32,
+) -> Result<Vec<ExpectedStream>> {
+    let capacity = usize::try_from(publisher_count).context("publisher count exceeds usize")?;
+    let mut expected = Vec::with_capacity(capacity);
+    for source_index in 0..publisher_count {
+        let source_index =
+            usize::try_from(source_index).context("audio source index exceeds usize")?;
+        if source_index != peer_index {
+            expected.push(ExpectedStream::audio(
+                source_id(room_index, peer_count, source_index)?,
+                packet_count,
+            )?);
+        }
+    }
+    Ok(expected)
+}
+
+fn expected_video_streams(
+    room_index: u32,
+    peer_count: u32,
+    publisher_count: u32,
+    peer_index: usize,
+    low_packets: u64,
+    high_packets: u64,
+) -> Result<Vec<ExpectedStream>> {
+    let featured = featured_source(peer_index, publisher_count);
+    let capacity = usize::try_from(publisher_count).context("publisher count exceeds usize")?;
+    let mut expected = Vec::with_capacity(capacity);
+    for source_index in 0..publisher_count {
+        let source_index_usize =
+            usize::try_from(source_index).context("video source index exceeds usize")?;
+        if source_index_usize == peer_index {
+            continue;
+        }
+        let layer = if featured == Some(source_index) {
+            VideoLayer::High
+        } else {
+            VideoLayer::Low
+        };
+        let packet_count = match layer {
+            VideoLayer::Low => low_packets,
+            VideoLayer::High => high_packets,
+        };
+        expected.push(ExpectedStream::video(
+            source_id(room_index, peer_count, source_index_usize)?,
+            layer,
+            u32::try_from(packet_count).context("video packet count exceeds u32")?,
+        )?);
+    }
+    Ok(expected)
 }
 
 fn featured_source(peer_index: usize, publisher_count: u32) -> Option<u32> {
@@ -595,7 +768,10 @@ async fn receive_until_complete(
 }
 
 async fn drain_pending(peer: &mut LoadPeer, ledger: &mut PacketLedger) -> Result<()> {
-    while let Some(payload) = peer.read_rtp_payload(Duration::ZERO).await? {
+    for _ in 0..OPPORTUNISTIC_DRAIN_LIMIT {
+        let Some(payload) = peer.read_rtp_payload(Duration::ZERO).await? else {
+            break;
+        };
         ledger.observe(&payload);
     }
     Ok(())

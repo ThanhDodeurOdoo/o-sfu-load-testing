@@ -9,7 +9,11 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use serde_json::Value;
 
-use crate::{AUDIO_PACKETS_PER_SECOND, ScenarioResult, ScenarioSpec};
+use crate::{
+    AUDIO_PACKET_PAYLOAD_BYTES, AUDIO_PACKETS_PER_SECOND, ScenarioResult, ScenarioSpec,
+    VIDEO_FRAMES_PER_SECOND, VIDEO_HIGH_PACKET_PAYLOAD_BYTES, VIDEO_KEYFRAME_INTERVAL,
+    VIDEO_LOW_PACKET_PAYLOAD_BYTES, video_packets_per_layer,
+};
 
 const CATEGORY_CHART_POINTS: usize = 4;
 const CPU_SMOOTHING_RADIUS: usize = 2;
@@ -485,6 +489,7 @@ fn render_report(
         writeln!(output, "No valid result files were available.\n")?;
     } else {
         render_workloads(&mut output, &runs)?;
+        render_media_profile(&mut output)?;
         render_scenario_legend(&mut output)?;
         render_delivery(&mut output, &runs)?;
         render_discrepancies(&mut output, &runs)?;
@@ -549,7 +554,7 @@ fn render_workloads(output: &mut String, runs: &[RunData]) -> Result<()> {
     writeln!(output, "## Workloads\n")?;
     writeln!(
         output,
-        "| Exact | Scenario | Rooms | Peers/room | Publishers/room | Streams | Routes | Offered packets | Expected deliveries | Duration | Max send lag | Pacing | Profile | Validation |"
+        "| Exact | Scenario | Rooms | Peers/room | Publications/room | Streams | Routes | Offered packets | Expected deliveries | Duration | Max send lag | Pacing | Profile | Validation |"
     )?;
     writeln!(
         output,
@@ -565,7 +570,7 @@ fn render_workloads(output: &mut String, runs: &[RunData]) -> Result<()> {
             scenario_label(scenario),
             scenario.room_count(),
             scenario.peers_per_room(),
-            scenario.publishers_per_room(),
+            publisher_label(scenario),
             grouped(result.plan.streams),
             grouped(result.plan.routes),
             grouped(result.plan.offered_packets),
@@ -581,11 +586,108 @@ fn render_workloads(output: &mut String, runs: &[RunData]) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn render_media_profile(output: &mut String) -> Result<()> {
+    ensure!(
+        1_000_u32.is_multiple_of(AUDIO_PACKETS_PER_SECOND),
+        "audio packet rate must contain whole milliseconds"
+    );
+    let audio_packetization_ms = 1_000 / AUDIO_PACKETS_PER_SECOND;
+    ensure!(
+        VIDEO_KEYFRAME_INTERVAL.is_multiple_of(u64::from(VIDEO_FRAMES_PER_SECOND)),
+        "video keyframe interval must contain complete seconds"
+    );
+    let profile_seconds = u32::try_from(
+        VIDEO_KEYFRAME_INTERVAL
+            .checked_div(u64::from(VIDEO_FRAMES_PER_SECOND))
+            .context("video keyframe interval is shorter than one second")?,
+    )
+    .context("video profile duration exceeds u32")?;
+    ensure!(
+        profile_seconds > 0,
+        "video profile duration must be positive"
+    );
+    let (low_packets, high_packets) = video_packets_per_layer(profile_seconds)?;
+    let audio_bps = u64::try_from(AUDIO_PACKET_PAYLOAD_BYTES)
+        .context("audio payload size exceeds u64")?
+        .checked_mul(u64::from(AUDIO_PACKETS_PER_SECOND))
+        .and_then(|bytes| bytes.checked_mul(8))
+        .context("audio profile bitrate overflowed")?;
+    let low_bps =
+        payload_rate_for_profile(low_packets, VIDEO_LOW_PACKET_PAYLOAD_BYTES, profile_seconds)?;
+    let high_bps = payload_rate_for_profile(
+        high_packets,
+        VIDEO_HIGH_PACKET_PAYLOAD_BYTES,
+        profile_seconds,
+    )?;
+
+    writeln!(output, "## Per-stream media load\n")?;
+    writeln!(
+        output,
+        "Rates are deterministic RTP payload only. They exclude RTP headers, SRTP, UDP, IP, RTCP and retransmissions. One camera publication contains two RTP streams, one per RID.\n"
+    )?;
+    writeln!(
+        output,
+        "Fixed payload sizes approximate average active-media output. Browser VBR, DTX and congestion control vary. The profile is a production high-load envelope, not a prediction of average meeting bandwidth.\n"
+    )?;
+    writeln!(
+        output,
+        "| Media unit | Payload model | RTP packets/s | RTP payload bitrate |"
+    )?;
+    writeln!(output, "| --- | --- | ---: | ---: |")?;
+    writeln!(
+        output,
+        "| One Opus audio RTP stream | {} B every {} ms | {} | {} bit/s |",
+        AUDIO_PACKET_PAYLOAD_BYTES,
+        audio_packetization_ms,
+        AUDIO_PACKETS_PER_SECOND,
+        grouped(audio_bps)
+    )?;
+    writeln!(
+        output,
+        "| One VP8 low RID RTP stream | {} B packets, {} fps | {} | {} bit/s |",
+        VIDEO_LOW_PACKET_PAYLOAD_BYTES,
+        VIDEO_FRAMES_PER_SECOND,
+        format_profile_packet_rate(low_packets, profile_seconds)?,
+        grouped(low_bps)
+    )?;
+    writeln!(
+        output,
+        "| One VP8 high RID RTP stream | {} B packets, {} fps | {} | {} bit/s |",
+        VIDEO_HIGH_PACKET_PAYLOAD_BYTES,
+        VIDEO_FRAMES_PER_SECOND,
+        format_profile_packet_rate(high_packets, profile_seconds)?,
+        grouped(high_bps)
+    )?;
+    writeln!(
+        output,
+        "| One VP8 camera publication, two RTP streams | {}-second GOP | {} | {} bit/s |",
+        profile_seconds,
+        format_profile_packet_rate(
+            low_packets
+                .checked_add(high_packets)
+                .context("camera profile packet count overflowed")?,
+            profile_seconds
+        )?,
+        grouped(
+            low_bps
+                .checked_add(high_bps)
+                .context("camera profile bitrate overflowed")?
+        )
+    )?;
+    writeln!(output)?;
+    writeln!(
+        output,
+        "The audio model is continuous active full-band speech at {} bit/s with the {audio_packetization_ms} ms Opus packetization default. The VP8 profile uses {VIDEO_FRAMES_PER_SECOND} frames/s and one keyframe every {profile_seconds} seconds. Both VP8 RID rates form a high-bitrate simulcast stress envelope. [Opus RTP guidance](https://www.rfc-editor.org/rfc/rfc7587.html) and [WebRTC bitrate units](https://www.w3.org/TR/webrtc/#dom-rtcrtpencodingparameters-maxbitrate).\n",
+        grouped(audio_bps)
+    )?;
+    Ok(())
+}
+
 pub(crate) fn render_scenario_legend(output: &mut String) -> Result<()> {
     writeln!(output, "## Scenario label legend\n")?;
     writeln!(
         output,
-        "Tables use hyphenated IDs. Graphs use `S` for smoke, `A` for audio mesh and `V` for video gallery.\n"
+        "Tables use hyphenated IDs. Graphs use `S` for smoke, `A` for audio mesh, `V` for video gallery and `M` for mixed conference.\n"
     )?;
     writeln!(
         output,
@@ -597,7 +699,11 @@ pub(crate) fn render_scenario_legend(output: &mut String) -> Result<()> {
     )?;
     writeln!(
         output,
-        "- `video-gallery-1x64-10p-60s` or `V 1x64/10p/60s` means 1 room with 64 peers. 10 peers per room publish video for 60 seconds.\n"
+        "- `video-gallery-1x64-10p-60s` or `V 1x64/10p/60s` means 1 room with 64 peers. 10 peers per room publish video for 60 seconds."
+    )?;
+    writeln!(
+        output,
+        "- `mixed-conference-1x100-10a-9v-60s` or `M 1x100/10a/9v/60s` means 1 room with 100 peers. 10 publish audio and the first 9 of those also publish video for 60 seconds.\n"
     )?;
     Ok(())
 }
@@ -1309,6 +1415,7 @@ pub(crate) fn pacing_valid(result: &ScenarioResult) -> bool {
     let interval_ms = match result.scenario {
         ScenarioSpec::Smoke { .. } | ScenarioSpec::AudioMesh { .. } => 20,
         ScenarioSpec::VideoGallery { .. } => 34,
+        ScenarioSpec::MixedConference { .. } => 20,
     };
     result.max_send_lag_ms <= interval_ms
 }
@@ -1317,11 +1424,12 @@ pub(crate) fn delivery_rate(result: &ScenarioResult) -> u64 {
     result.achieved_deliveries_per_second()
 }
 
-pub(crate) fn scenario_key(spec: ScenarioSpec) -> (u8, u64, u64, u32, u32, u32, u32) {
+pub(crate) fn scenario_key(spec: ScenarioSpec) -> (u8, u64, u64, u32, u32, u32, u32, u32) {
     let rank = match spec {
         ScenarioSpec::Smoke { .. } => 0,
         ScenarioSpec::AudioMesh { .. } => 1,
         ScenarioSpec::VideoGallery { .. } => 2,
+        ScenarioSpec::MixedConference { .. } => 3,
     };
     let duration = u64::from(spec.duration_seconds()).max(1);
     let expected_deliveries = spec
@@ -1335,7 +1443,8 @@ pub(crate) fn scenario_key(spec: ScenarioSpec) -> (u8, u64, u64, u32, u32, u32, 
         expected_deliveries,
         spec.room_count(),
         spec.peers_per_room(),
-        spec.publishers_per_room(),
+        spec.audio_publishers_per_room(),
+        spec.video_publishers_per_room(),
         spec.duration_seconds(),
     )
 }
@@ -1356,6 +1465,26 @@ pub(crate) fn scenario_label(spec: ScenarioSpec) -> String {
             publishers,
             seconds,
         } => format!("video-gallery-{rooms}x{peers}-{publishers}p-{seconds}s"),
+        ScenarioSpec::MixedConference {
+            rooms,
+            peers,
+            audio_publishers,
+            video_publishers,
+            seconds,
+        } => format!(
+            "mixed-conference-{rooms}x{peers}-{audio_publishers}a-{video_publishers}v-{seconds}s"
+        ),
+    }
+}
+
+fn publisher_label(spec: ScenarioSpec) -> String {
+    match (
+        spec.audio_publishers_per_room(),
+        spec.video_publishers_per_room(),
+    ) {
+        (audio, 0) => format!("{audio} audio"),
+        (0, video) => format!("{video} video"),
+        (audio, video) => format!("{audio} audio / {video} video"),
     }
 }
 
@@ -1375,6 +1504,13 @@ pub(crate) fn chart_label(spec: ScenarioSpec) -> String {
             publishers,
             seconds,
         } => format!("V {rooms}x{peers}/{publishers}p/{seconds}s"),
+        ScenarioSpec::MixedConference {
+            rooms,
+            peers,
+            audio_publishers,
+            video_publishers,
+            seconds,
+        } => format!("M {rooms}x{peers}/{audio_publishers}a/{video_publishers}v/{seconds}s"),
     }
 }
 
@@ -1400,9 +1536,9 @@ fn scheduled_payload_bits_per_second(result: &ScenarioResult) -> u64 {
         ScenarioSpec::Smoke { packets, .. } => {
             u64::from(packets) * 1_000 / u64::from(AUDIO_PACKETS_PER_SECOND)
         }
-        ScenarioSpec::AudioMesh { seconds, .. } | ScenarioSpec::VideoGallery { seconds, .. } => {
-            u64::from(seconds) * 1_000
-        }
+        ScenarioSpec::AudioMesh { seconds, .. }
+        | ScenarioSpec::VideoGallery { seconds, .. }
+        | ScenarioSpec::MixedConference { seconds, .. } => u64::from(seconds) * 1_000,
     };
     payload_bits_per_second(result.plan.offered_payload_bytes, duration_ms)
 }
@@ -1417,6 +1553,36 @@ fn payload_bits_per_second(bytes: u64, elapsed_ms: u64) -> u64 {
     }
     let rate = u128::from(bytes) * 8_000 / u128::from(elapsed_ms);
     u64::try_from(rate).unwrap_or(u64::MAX)
+}
+
+fn payload_rate_for_profile(packet_count: u64, payload_bytes: usize, seconds: u32) -> Result<u64> {
+    ensure!(seconds > 0, "media profile duration must be positive");
+    let bits = packet_count
+        .checked_mul(u64::try_from(payload_bytes).context("payload size exceeds u64")?)
+        .and_then(|bytes| bytes.checked_mul(8))
+        .context("media profile bitrate overflowed")?;
+    ensure!(
+        bits.is_multiple_of(u64::from(seconds)),
+        "media profile bitrate is not an exact integer"
+    );
+    Ok(bits / u64::from(seconds))
+}
+
+fn format_profile_packet_rate(packet_count: u64, seconds: u32) -> Result<String> {
+    ensure!(seconds > 0, "media profile duration must be positive");
+    let tenths = u128::from(packet_count)
+        .checked_mul(10)
+        .context("media profile packet rate overflowed")?;
+    ensure!(
+        tenths.is_multiple_of(u128::from(seconds)),
+        "media profile packet rate needs more than one decimal"
+    );
+    let tenths = tenths / u128::from(seconds);
+    if tenths.is_multiple_of(10) {
+        Ok(grouped(u64::try_from(tenths / 10).unwrap_or(u64::MAX)))
+    } else {
+        Ok(format!("{}.{:01}", tenths / 10, tenths % 10))
+    }
 }
 
 fn rounded_div(value: u64, divisor: u64) -> u64 {

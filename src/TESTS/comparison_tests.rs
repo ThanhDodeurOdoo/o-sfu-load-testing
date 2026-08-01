@@ -39,6 +39,22 @@ fn comparison_renders_revision_lines_and_deltas() -> anyhow::Result<()> {
 }
 
 #[test]
+fn comparison_pairs_mixed_conference_contracts() -> anyhow::Result<()> {
+    let spec = ScenarioSpec::mixed_conference(1, 100, 10, 9, 60)?;
+    let baseline = run(spec, BASELINE_REVISION, 60_000, 0)?;
+    let comparison = run(spec, COMPARISON_REVISION, 60_000, 0)?;
+
+    let report = render_runs(vec![baseline], vec![comparison])?;
+
+    assert!(report.contains("| PASS | IDENTICAL | VALID | INVALID | 1 | 0 |"));
+    assert!(report.contains(
+        "| mixed-conference-1x100-10a-9v-60s | opus-vp8-mixed-conference-v1 | 6,955,530 | 60 s |"
+    ));
+    assert!(report.contains("## Per-stream media load"));
+    Ok(())
+}
+
+#[test]
 fn comparison_chunks_scenarios_before_labels_become_dense() -> anyhow::Result<()> {
     let mut baseline = Vec::new();
     let mut comparison = Vec::new();
@@ -67,7 +83,7 @@ fn comparison_rejects_workload_contract_mismatch() -> anyhow::Result<()> {
 
     assert!(report.contains("| FAIL | MISMATCH | VALID | INVALID |"));
     assert!(report.contains("smoke-1r-50p has different workload contracts"));
-    assert!(report.contains("| smoke-1r-50p | opus-fanout-smoke-v2 | 50 | 1 s |"));
+    assert!(report.contains("| smoke-1r-50p | opus-fanout-smoke-v3 | 50 | 1 s |"));
     assert!(!report.contains("```mermaid"));
     Ok(())
 }
@@ -187,7 +203,7 @@ fn run(
 ) -> anyhow::Result<RunData> {
     let plan = spec.plan()?;
     let result = serde_json::from_value::<ScenarioResult>(json!({
-        "schemaVersion": 3,
+        "schemaVersion": 4,
         "profile": spec.profile(),
         "oSfuRevision": revision,
         "scenario": spec,

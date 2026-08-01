@@ -28,14 +28,42 @@ fn report_sorts_workloads_and_renders_visual_rates() -> anyhow::Result<()> {
     assert!(report.contains("x-axis [\"S 1r/50p\", \"A 1x10/1s\"]"));
     assert!(report.contains("line [50, 4500]"));
     assert!(report.contains("title \"Scheduled sender and receiver-observed RTP payload\""));
-    assert!(report.contains("line [64, 640]"));
-    assert!(report.contains("line [64, 5760]"));
+    assert!(report.contains("line [32, 320]"));
+    assert!(report.contains("line [32, 2880]"));
     assert!(!report.contains("    bar ["));
     assert!(report.contains("accTitle: Observed receiver deliveries per second"));
     assert!(report.contains("accDescr: The line compares receiver-observed delivery rates"));
     assert!(report.contains("## Scenario label legend"));
     assert!(report.contains("`video-gallery-1x64-10p-60s` or `V 1x64/10p/60s`"));
     assert!(report.contains("| audio-mesh-1x10-1s | 4,500 | 4,500 | 4,500/s |"));
+    Ok(())
+}
+
+#[test]
+fn report_describes_mixed_conference_and_exact_media_units() -> anyhow::Result<()> {
+    let mixed = run(ScenarioSpec::mixed_conference(1, 100, 10, 9, 60)?, None, 0)?;
+
+    let report = render_runs(vec![mixed], None)?;
+
+    assert!(report.contains("## Per-stream media load"));
+    assert!(
+        report.contains("| One Opus audio RTP stream | 80 B every 20 ms | 50 | 32,000 bit/s |")
+    );
+    assert!(
+        report.contains(
+            "| One VP8 low RID RTP stream | 600 B packets, 30 fps | 30.5 | 146,400 bit/s |"
+        )
+    );
+    assert!(report.contains(
+        "| One VP8 high RID RTP stream | 1100 B packets, 30 fps | 423 | 3,722,400 bit/s |"
+    ));
+    assert!(report.contains(
+        "| One VP8 camera publication, two RTP streams | 2-second GOP | 453.5 | 3,868,800 bit/s |"
+    ));
+    assert!(report.contains(
+        "| PASS | mixed-conference-1x100-10a-9v-60s | 1 | 100 | 10 audio / 9 video | 28 | 1,881 | 274,890 | 6,955,530 | 60 s |"
+    ));
+    assert!(report.contains("`M 1x100/10a/9v/60s`"));
     Ok(())
 }
 
@@ -262,7 +290,7 @@ fn scheduled_sender_rate_excludes_receiver_drain_time() -> anyhow::Result<()> {
     assert!(report.contains(
         "The Scheduled sender and receiver-observed RTP payload chart is omitted because fewer than two scenarios have chartable values. The tabular metrics remain available."
     ));
-    assert!(report.contains("| 64.0 kbit/s | 32.0 kbit/s |"));
+    assert!(report.contains("| 32.0 kbit/s | 16.0 kbit/s |"));
     Ok(())
 }
 
@@ -487,7 +515,7 @@ fn run(
     let plan = spec.plan()?;
     let delivered_packets = delivered_packets.unwrap_or(plan.expected_deliveries);
     let result = serde_json::from_value::<ScenarioResult>(json!({
-        "schemaVersion": 3,
+        "schemaVersion": 4,
         "profile": spec.profile(),
         "oSfuRevision": "deadbeef",
         "scenario": spec,

@@ -12,8 +12,8 @@ use crate::report::{
     ChartSeries, LoadFailure, MAX_INPUTS, RunData, TelemetrySummary, chart_label,
     delivered_payload_bits_per_second, delivery_rate, ensure_summary_size, escape_table,
     format_bits_per_second, format_cpu_percent, format_mebibytes, format_milliseconds, load_run,
-    pacing_valid, render_category_charts, render_scenario_legend, scenario_key, scenario_label,
-    validate_artifact_url, validate_run,
+    pacing_valid, render_category_charts, render_media_profile, render_scenario_legend,
+    scenario_key, scenario_label, validate_artifact_url, validate_run,
 };
 
 struct Side {
@@ -183,6 +183,7 @@ fn render_sides(baseline: &Side, comparison: &Side, artifact_url: Option<&str>) 
         writeln!(output, "No scenario pair was available for comparison.\n")?;
     } else {
         render_workload_identity(&mut output, &pairing.pairs)?;
+        render_media_profile(&mut output)?;
         render_scenario_legend(&mut output)?;
         render_exact_delivery(&mut output, &pairing.pairs)?;
         render_graphs(

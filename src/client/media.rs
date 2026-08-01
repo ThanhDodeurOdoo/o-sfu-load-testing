@@ -18,8 +18,9 @@ const IDENTITY_MAGIC: [u8; 4] = *b"OSFU";
 const IDENTITY_VERSION: u8 = 1;
 const IDENTITY_HEADER_LEN: usize = 22;
 const VP8_DESCRIPTOR_LEN: usize = 6;
+const OPUS_HYBRID_FULLBAND_20_MS_CONFIG: u8 = 15;
 const ONE_FRAME_TOC: u8 =
-    (opus::toc_config::SILK_WIDEBAND_20_MS << 3) | opus::frame_count_code::ONE_FRAME;
+    (OPUS_HYBRID_FULLBAND_20_MS_CONFIG << 3) | opus::frame_count_code::ONE_FRAME;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PacketPhase {
@@ -155,9 +156,53 @@ pub struct VideoPacket {
 
 pub struct AudioSource {
     source: u16,
-    emitted_at: Duration,
+    timeline: MediaTimeline,
     next_rtp_timestamp: u32,
     next_sequence_number: u16,
+}
+
+struct MediaTimeline {
+    first_emitted_at: Duration,
+    next_emitted_at: Duration,
+    interval: Duration,
+}
+
+impl MediaTimeline {
+    const fn new(interval: Duration) -> Self {
+        Self {
+            first_emitted_at: interval,
+            next_emitted_at: interval,
+            interval,
+        }
+    }
+
+    fn staggered(interval: Duration, source_index: u32, source_count: u32) -> Self {
+        let source_count = source_count.max(1);
+        let slot = source_index.saturating_add(1).min(source_count);
+        let first_emitted_at = interval
+            .checked_div(source_count)
+            .unwrap_or(interval)
+            .saturating_mul(slot);
+        Self {
+            first_emitted_at,
+            next_emitted_at: first_emitted_at,
+            interval,
+        }
+    }
+
+    const fn next_emitted_at(&self) -> Duration {
+        self.next_emitted_at
+    }
+
+    fn advance(&mut self) -> Duration {
+        let emitted_at = self.next_emitted_at;
+        self.next_emitted_at = self.next_emitted_at.saturating_add(self.interval);
+        emitted_at
+    }
+
+    fn reset(&mut self) {
+        self.next_emitted_at = self.first_emitted_at;
+    }
 }
 
 impl AudioSource {
@@ -165,14 +210,27 @@ impl AudioSource {
     pub const fn new(source: u16) -> Self {
         Self {
             source,
-            emitted_at: Duration::ZERO,
+            timeline: MediaTimeline::new(AUDIO_FRAME_INTERVAL),
             next_rtp_timestamp: 0,
             next_sequence_number: 0,
         }
     }
 
+    #[must_use]
+    pub fn staggered(source: u16, source_index: u32, source_count: u32) -> Self {
+        Self {
+            timeline: MediaTimeline::staggered(AUDIO_FRAME_INTERVAL, source_index, source_count),
+            ..Self::new(source)
+        }
+    }
+
+    #[must_use]
+    pub const fn next_emitted_at(&self) -> Duration {
+        self.timeline.next_emitted_at()
+    }
+
     pub fn next_packet(&mut self, phase: PacketPhase, ordinal: u32) -> AudioPacket {
-        self.emitted_at += AUDIO_FRAME_INTERVAL;
+        let emitted_at = self.timeline.advance();
         let sequence_number = self.next_sequence_number;
         self.next_sequence_number = self.next_sequence_number.wrapping_add(1);
         let rtp_timestamp = self.next_rtp_timestamp;
@@ -188,7 +246,7 @@ impl AudioSource {
             fragments: 1,
         };
         AudioPacket {
-            emitted_at: self.emitted_at,
+            emitted_at,
             rtp_timestamp,
             sequence_number,
             extension_values: ExtensionValues {
@@ -201,13 +259,13 @@ impl AudioSource {
     }
 
     pub fn reset_timeline(&mut self) {
-        self.emitted_at = Duration::ZERO;
+        self.timeline.reset();
     }
 }
 
 pub struct VideoSource {
     source: u16,
-    emitted_at: Duration,
+    timeline: MediaTimeline,
     next_rtp_timestamp: u32,
     low: VideoLayerState,
     high: VideoLayerState,
@@ -238,7 +296,7 @@ impl VideoSource {
     pub const fn new(source: u16) -> Self {
         Self {
             source,
-            emitted_at: Duration::ZERO,
+            timeline: MediaTimeline::new(VIDEO_FRAME_INTERVAL),
             next_rtp_timestamp: 0,
             low: VideoLayerState::new(0),
             high: VideoLayerState::new(30_000),
@@ -249,8 +307,21 @@ impl VideoSource {
         }
     }
 
+    #[must_use]
+    pub fn staggered(source: u16, source_index: u32, source_count: u32) -> Self {
+        Self {
+            timeline: MediaTimeline::staggered(VIDEO_FRAME_INTERVAL, source_index, source_count),
+            ..Self::new(source)
+        }
+    }
+
+    #[must_use]
+    pub const fn next_emitted_at(&self) -> Duration {
+        self.timeline.next_emitted_at()
+    }
+
     pub fn next_frame(&mut self, phase: PacketPhase, frame: u32) -> Vec<VideoPacket> {
-        self.emitted_at += VIDEO_FRAME_INTERVAL;
+        let emitted_at = self.timeline.advance();
         let timestamp = self.next_rtp_timestamp;
         self.next_rtp_timestamp = self.next_rtp_timestamp.wrapping_add(VIDEO_TIMESTAMP_STEP);
         let keyframe = u64::from(frame).is_multiple_of(VIDEO_KEYFRAME_INTERVAL);
@@ -270,7 +341,7 @@ impl VideoSource {
         append_video_layer(
             &mut packets,
             self.source,
-            self.emitted_at,
+            emitted_at,
             timestamp,
             phase,
             frame,
@@ -286,7 +357,7 @@ impl VideoSource {
         append_video_layer(
             &mut packets,
             self.source,
-            self.emitted_at,
+            emitted_at,
             timestamp,
             phase,
             frame,
@@ -303,7 +374,7 @@ impl VideoSource {
     }
 
     pub fn reset_timeline(&mut self) {
-        self.emitted_at = Duration::ZERO;
+        self.timeline.reset();
     }
 }
 

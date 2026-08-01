@@ -52,6 +52,18 @@ enum ScenarioCommand {
         #[arg(long)]
         seconds: u32,
     },
+    MixedConference {
+        #[arg(long)]
+        rooms: u32,
+        #[arg(long)]
+        peers: u32,
+        #[arg(long)]
+        audio_publishers: u32,
+        #[arg(long)]
+        video_publishers: u32,
+        #[arg(long)]
+        seconds: u32,
+    },
 }
 
 #[tokio::main]
@@ -70,6 +82,19 @@ async fn main() -> Result<()> {
             publishers,
             seconds,
         } => ScenarioSpec::video_gallery(rooms, peers, publishers, seconds)?,
+        ScenarioCommand::MixedConference {
+            rooms,
+            peers,
+            audio_publishers,
+            video_publishers,
+            seconds,
+        } => ScenarioSpec::mixed_conference(
+            rooms,
+            peers,
+            audio_publishers,
+            video_publishers,
+            seconds,
+        )?,
     };
     run(RunConfig {
         server_binary: cli.server_binary,

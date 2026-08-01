@@ -23,18 +23,46 @@ local client shares one loopback origin.
 
 `smoke` keeps the small one-publisher correctness test. `audio-mesh` makes
 every peer publish Opus and receive every other peer. `video-gallery` makes a
-bounded set of peers publish two-RID VP8 simulcast. Each peer selects one remote
-publisher as featured when available and receives other sources as thumbnails.
+bounded set of peers publish two-RID VP8 simulcast. `mixed-conference` combines
+audio and video on the same participants and RTC connections. Each peer selects
+one remote camera as featured when available and receives other cameras as
+thumbnails. Mixed publishers use deterministic phase offsets within each media
+interval so independent sources do not form synchronized sender bursts.
 
-The audio profile sends one synthetic 160-byte Opus RTP payload every 20 ms.
-That is 50 packets/s and 64 kbit/s per publisher. The realistic load comes from
-concurrent publishers, RTP cadence and fanout rather than encoded speech.
+### Media units
 
-The video profile sends synthetic VP8 RTP packet bursts at 30 frames/s with
-two-second keyframe signaling. Over each complete two-second profile the low
-RID averages 146.4 kbit/s and the high RID averages 3.7224 Mbit/s. Both RIDs use
-valid VP8 payload descriptors, PictureID, TL0PICIDX and marker semantics.
-Payload bodies carry deterministic identities rather than decodable video.
+The fixed sizes approximate average active-media output. They are deterministic
+codec-shaped RTP payloads rather than recorded encoder output. Browser output
+varies around the target and may drop below it with VBR, silence, DTX or
+congestion.
+
+| Media unit | Deterministic payload model | RTP packets/s | RTP payload bitrate |
+| --- | --- | ---: | ---: |
+| One Opus audio RTP stream | 80 B every 20 ms | 50 | 32,000 bit/s |
+| One VP8 low RID RTP stream | 600 B fragments, 30 fps | 30.5 average | 146,400 bit/s |
+| One VP8 high RID RTP stream | 1,100 B fragments, 30 fps | 423 average | 3,722,400 bit/s |
+| One VP8 camera publication, two RTP streams | Low plus high RID | 453.5 average | 3,868,800 bit/s |
+
+One participant publishing audio and camera therefore offers 503.5 RTP
+packets/s and 3,900,800 bit/s of RTP payload. The audio model represents
+continuous active full-band speech. Its 20 ms packetization is the Opus default
+and 32 kbit/s is within the 28 to 40 kbit/s range recommended for full-band
+speech in [RFC 7587](https://www.rfc-editor.org/rfc/rfc7587.html).
+
+The video averages cover one complete two-second GOP at 30 frames/s. The low
+and high rates sit below o-sfu's negotiated
+[150 kbit/s low RID](https://github.com/ThanhDodeurOdoo/o-sfu/blob/9cae4cbaa196564fbebee033dc4e9e772b714124/crates/core/src/engine/media_transport/rtc/simulcast/common.rs#L14-L55)
+and [4 Mbit/s high RID](https://github.com/ThanhDodeurOdoo/o-sfu/blob/9cae4cbaa196564fbebee033dc4e9e772b714124/crates/core/src/options/media.rs#L274-L290)
+defaults. The high RID is a production near-cap stress profile rather than an
+ordinary camera average. The fixed GOP adds conservative keyframe pressure.
+Both RIDs use VP8 payload descriptors, PictureID, TL0PICIDX and marker
+semantics. Payload bodies carry deterministic identities rather than decodable
+video.
+
+Every rate above is RTP payload only. It excludes RTP headers, SRTP, UDP, IP,
+RTCP and retransmissions. WebRTC similarly defines `maxBitrate` without IP or
+transport-layer overhead in the
+[WebRTC specification](https://www.w3.org/TR/webrtc/#dom-rtcrtpencodingparameters-maxbitrate).
 
 Every measured payload carries an immutable source, layer, frame and fragment
 identity. Receivers validate each source-to-receiver route independently.
@@ -64,6 +92,13 @@ target/release/o-sfu-load \
   --rtc-binary target/release/o-sfu-load-rtc \
   --output artifacts/video \
   video-gallery --rooms 1 --peers 12 --publishers 4 --seconds 30
+
+target/release/o-sfu-load \
+  --server-binary target/release/o-sfu-load-server \
+  --rtc-binary target/release/o-sfu-load-rtc \
+  --output artifacts/mixed \
+  mixed-conference --rooms 1 --peers 100 \
+    --audio-publishers 10 --video-publishers 9 --seconds 60
 ```
 
 Linux runs can isolate the o-sfu process from the RTC generator:
@@ -123,11 +158,11 @@ per room and a 60 second workload.
 
 ## CPU profiling
 
-The nightly workflow runs a separate 1-room by 28-peer audio replay after the
-ordinary measurements. Linux `perf` samples only the o-sfu process with the
-software `cpu-clock` event at a requested 99 Hz. The profiling server is
-rebuilt with debug information and forced frame pointers. The RTC generator
-remains a separate process on CPUs 1 through 3.
+The nightly workflow replays the 100-peer mixed conference after the ordinary
+measurements. Linux `perf` samples only the o-sfu process with the software
+`cpu-clock` event at a requested 99 Hz. The profiling server is rebuilt with
+debug information and forced frame pointers. The RTC generator remains a
+separate process on CPUs 1 through 3.
 
 `o-sfu-load-profile` collapses the captured stacks and uses
 [Inferno](https://github.com/jonhoo/inferno) to generate an interactive SVG
@@ -160,7 +195,7 @@ revisions after their ordinary scenarios have completed.
 CI runs the bounded smoke. The nightly workflow runs these fixed profiles
 using four assigned logical CPUs:
 
-| Profile | Publishers/room | Consumers/source | Deliveries/s | Exact deliveries |
+| Profile | Publications/room | Consumers/source | Deliveries/s | Exact deliveries |
 | --- | ---: | ---: | ---: | ---: |
 | 1 room × 8 audio peers × 30 s | 8 | 7 | 2,800 | 84,000 |
 | 2 rooms × 12 audio peers × 60 s | 12 | 11 | 13,200 | 792,000 |
@@ -168,12 +203,17 @@ using four assigned logical CPUs:
 | 1 room × 28 audio peers × 120 s | 28 | 27 | 37,800 | 4,536,000 |
 | 1 room × 12 peers × 4 cameras × 30 s | 4 | 11 | 6,052 | 181,560 |
 | 1 room × 64 peers × 10 cameras × 60 s | 10 | 63 | 44,335 | 2,660,100 |
+| 1 room × 100 peers × 10 audio + 9 cameras × 60 s | 10 audio + 9 video | 99 | 115,925.5 | 6,955,530 |
 
 The 28-peer audio room exercises 756 simultaneous source-to-receiver routes.
 The 64-peer video room exercises 10 simulcast publishers and 630 selected
-source-to-receiver routes. The nightly run requires 10,629,660 exact forwarded
-deliveries. Its job summary renders the graphs directly without requiring an
-artifact download. Artifacts retain the detailed evidence.
+source-to-receiver routes. The 100-peer mixed conference uses 10 audio
+publishers. The first 9 also publish both VP8 RIDs. It exercises 28 incoming RTP
+streams, 1,881 selected routes, 4,581.5 incoming packets/s and 115,925.5
+forwarded packets/s. That is 35.1392 Mbit/s of incoming RTP payload and 519.7224
+Mbit/s of forwarded RTP payload. The nightly run requires 17,585,190 exact
+forwarded deliveries. Its job summary renders the graphs directly without
+requiring an artifact download. Artifacts retain the detailed evidence.
 
 Scheduled runs and manual runs without comparison inputs keep the ordinary
 single-version behavior. A manual comparison accepts `comparison_revision` as

@@ -30,7 +30,7 @@ const STARTUP_ATTEMPTS: u8 = 3;
 const READINESS_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const PEER_SETUP_TIMEOUT: Duration = Duration::from_secs(20);
+const SETUP_ROUND_TIMEOUT: Duration = Duration::from_secs(20);
 const RTC_WORKER_OVERHEAD: Duration = Duration::from_secs(40);
 
 pub struct RunConfig {
@@ -353,8 +353,10 @@ enum RtcWorkerCompletion {
 }
 
 fn rtc_worker_deadline(spec: ScenarioSpec) -> Duration {
-    let peer_count = u64::from(spec.peers_per_room());
-    let setup_seconds = peer_count.saturating_mul(PEER_SETUP_TIMEOUT.as_secs());
+    let setup_rounds = u64::from(spec.audio_publishers_per_room())
+        .saturating_add(u64::from(spec.video_publishers_per_room()))
+        .saturating_add(1);
+    let setup_seconds = setup_rounds.saturating_mul(SETUP_ROUND_TIMEOUT.as_secs());
     let media_seconds = u64::from(spec.duration_seconds());
     Duration::from_secs(setup_seconds)
         .saturating_add(Duration::from_secs(media_seconds))
@@ -508,3 +510,7 @@ impl ShutdownSignals {
         ctrl_c().await.context("failed to wait for Ctrl-C")
     }
 }
+
+#[cfg(test)]
+#[path = "TESTS/controller_tests.rs"]
+mod tests;

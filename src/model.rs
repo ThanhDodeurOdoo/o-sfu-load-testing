@@ -3,9 +3,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::O_SFU_REVISION;
 
-pub const RESULT_SCHEMA_VERSION: u32 = 3;
+pub const RESULT_SCHEMA_VERSION: u32 = 4;
 pub const AUDIO_PACKETS_PER_SECOND: u32 = 50;
-pub const AUDIO_PACKET_PAYLOAD_BYTES: usize = 160;
+pub const AUDIO_PACKET_PAYLOAD_BYTES: usize = 80;
 pub const VIDEO_FRAMES_PER_SECOND: u32 = 30;
 pub const VIDEO_KEYFRAME_INTERVAL: u64 = 60;
 pub const VIDEO_LOW_DELTA_PACKETS: u64 = 1;
@@ -18,7 +18,11 @@ const MAX_OFFERED_PACKETS: u64 = 100_000_000;
 const MAX_EXPECTED_DELIVERIES: u64 = 1_000_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "kebab-case")]
+#[serde(
+    tag = "type",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
 pub enum ScenarioSpec {
     Smoke {
         receivers: u32,
@@ -33,6 +37,13 @@ pub enum ScenarioSpec {
         rooms: u32,
         peers: u32,
         publishers: u32,
+        seconds: u32,
+    },
+    MixedConference {
+        rooms: u32,
+        peers: u32,
+        audio_publishers: u32,
+        video_publishers: u32,
         seconds: u32,
     },
 }
@@ -58,6 +69,13 @@ impl ScenarioSpec {
                 publishers,
                 seconds,
             } => Self::video_gallery(rooms, peers, publishers, seconds)?,
+            Self::MixedConference {
+                rooms,
+                peers,
+                audio_publishers,
+                video_publishers,
+                seconds,
+            } => Self::mixed_conference(rooms, peers, audio_publishers, video_publishers, seconds)?,
         };
         Ok(())
     }
@@ -137,11 +155,66 @@ impl ScenarioSpec {
         Ok(spec)
     }
 
+    /// Builds a conference where camera publishers also publish audio.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the scenario has no work or exceeds o-sfu's
+    /// room-size, active-audio or active-video-download contracts.
+    pub fn mixed_conference(
+        rooms: u32,
+        peers: u32,
+        audio_publishers: u32,
+        video_publishers: u32,
+        seconds: u32,
+    ) -> Result<Self> {
+        ensure!((1..=64).contains(&rooms), "rooms must be between 1 and 64");
+        ensure!(
+            (3..=100).contains(&peers),
+            "peers must be between 3 and 100"
+        );
+        ensure!(
+            audio_publishers > 0,
+            "audio publishers must be greater than zero"
+        );
+        ensure!(
+            audio_publishers <= peers,
+            "audio publishers cannot exceed peers"
+        );
+        ensure!(
+            video_publishers > 0,
+            "video publishers must be greater than zero"
+        );
+        ensure!(
+            video_publishers <= audio_publishers,
+            "video publishers must be a subset of audio publishers"
+        );
+        ensure!(
+            video_publishers <= 10,
+            "video publishers cannot exceed ten video downloads"
+        );
+        ensure!(
+            (1..=3_600).contains(&seconds),
+            "seconds must be between 1 and 3600"
+        );
+        let spec = Self::MixedConference {
+            rooms,
+            peers,
+            audio_publishers,
+            video_publishers,
+            seconds,
+        };
+        spec.validate_plan_size()?;
+        Ok(spec)
+    }
+
     #[must_use]
     pub const fn room_count(self) -> u32 {
         match self {
             Self::Smoke { .. } => 1,
-            Self::AudioMesh { rooms, .. } | Self::VideoGallery { rooms, .. } => rooms,
+            Self::AudioMesh { rooms, .. }
+            | Self::VideoGallery { rooms, .. }
+            | Self::MixedConference { rooms, .. } => rooms,
         }
     }
 
@@ -149,16 +222,32 @@ impl ScenarioSpec {
     pub const fn peers_per_room(self) -> u32 {
         match self {
             Self::Smoke { receivers, .. } => receivers + 1,
-            Self::AudioMesh { peers, .. } | Self::VideoGallery { peers, .. } => peers,
+            Self::AudioMesh { peers, .. }
+            | Self::VideoGallery { peers, .. }
+            | Self::MixedConference { peers, .. } => peers,
         }
     }
 
     #[must_use]
-    pub const fn publishers_per_room(self) -> u32 {
+    pub const fn audio_publishers_per_room(self) -> u32 {
         match self {
             Self::Smoke { .. } => 1,
             Self::AudioMesh { peers, .. } => peers,
+            Self::VideoGallery { .. } => 0,
+            Self::MixedConference {
+                audio_publishers, ..
+            } => audio_publishers,
+        }
+    }
+
+    #[must_use]
+    pub const fn video_publishers_per_room(self) -> u32 {
+        match self {
+            Self::Smoke { .. } | Self::AudioMesh { .. } => 0,
             Self::VideoGallery { publishers, .. } => publishers,
+            Self::MixedConference {
+                video_publishers, ..
+            } => video_publishers,
         }
     }
 
@@ -166,16 +255,19 @@ impl ScenarioSpec {
     pub const fn duration_seconds(self) -> u32 {
         match self {
             Self::Smoke { packets, .. } => packets.div_ceil(AUDIO_PACKETS_PER_SECOND),
-            Self::AudioMesh { seconds, .. } | Self::VideoGallery { seconds, .. } => seconds,
+            Self::AudioMesh { seconds, .. }
+            | Self::VideoGallery { seconds, .. }
+            | Self::MixedConference { seconds, .. } => seconds,
         }
     }
 
     #[must_use]
     pub const fn profile(self) -> &'static str {
         match self {
-            Self::Smoke { .. } => "opus-fanout-smoke-v2",
-            Self::AudioMesh { .. } => "opus-20ms-audio-mesh-v1",
+            Self::Smoke { .. } => "opus-fanout-smoke-v3",
+            Self::AudioMesh { .. } => "opus-20ms-audio-mesh-v2",
             Self::VideoGallery { .. } => "vp8-simulcast-gallery-v1",
+            Self::MixedConference { .. } => "opus-vp8-mixed-conference-v1",
         }
     }
 
@@ -183,6 +275,9 @@ impl ScenarioSpec {
     pub const fn active_audio_speakers(self) -> u32 {
         match self {
             Self::AudioMesh { peers, .. } => peers,
+            Self::MixedConference {
+                audio_publishers, ..
+            } => audio_publishers,
             Self::Smoke { .. } | Self::VideoGallery { .. } => 4,
         }
     }
@@ -211,34 +306,20 @@ impl ScenarioSpec {
                 rooms,
                 peers,
                 seconds,
-            } => {
-                let rooms = u64::from(rooms);
-                let peers = u64::from(peers);
-                let packets_per_publisher =
-                    checked_mul(u64::from(seconds), u64::from(AUDIO_PACKETS_PER_SECOND))?;
-                let streams = checked_mul(rooms, peers)?;
-                let remote_peers = peers
-                    .checked_sub(1)
-                    .ok_or_else(|| anyhow::anyhow!("audio mesh requires at least two peers"))?;
-                let routes = checked_mul(streams, remote_peers)?;
-                let offered_packets = checked_mul(streams, packets_per_publisher)?;
-                let expected_deliveries = checked_mul(routes, packets_per_publisher)?;
-                let payload_bytes = byte_count(AUDIO_PACKET_PAYLOAD_BYTES)?;
-                WorkloadPlan::new(
-                    streams,
-                    routes,
-                    offered_packets,
-                    checked_mul(offered_packets, payload_bytes)?,
-                    expected_deliveries,
-                    checked_mul(expected_deliveries, payload_bytes)?,
-                )
-            }
+            } => audio_plan(rooms, peers, peers, seconds),
             Self::VideoGallery {
                 rooms,
                 peers,
                 publishers,
                 seconds,
             } => video_plan(rooms, peers, publishers, seconds),
+            Self::MixedConference {
+                rooms,
+                peers,
+                audio_publishers,
+                video_publishers,
+                seconds,
+            } => mixed_plan(rooms, peers, audio_publishers, video_publishers, seconds),
         }
     }
 
@@ -487,6 +568,30 @@ impl ScenarioResult {
     }
 }
 
+fn audio_plan(rooms: u32, peers: u32, publishers: u32, seconds: u32) -> Result<WorkloadPlan> {
+    let rooms = u64::from(rooms);
+    let peers = u64::from(peers);
+    let publishers = u64::from(publishers);
+    let packets_per_publisher =
+        checked_mul(u64::from(seconds), u64::from(AUDIO_PACKETS_PER_SECOND))?;
+    let streams = checked_mul(rooms, publishers)?;
+    let remote_peers = peers
+        .checked_sub(1)
+        .ok_or_else(|| anyhow::anyhow!("audio workload requires at least two peers"))?;
+    let routes = checked_mul(streams, remote_peers)?;
+    let offered_packets = checked_mul(streams, packets_per_publisher)?;
+    let expected_deliveries = checked_mul(routes, packets_per_publisher)?;
+    let payload_bytes = byte_count(AUDIO_PACKET_PAYLOAD_BYTES)?;
+    WorkloadPlan::new(
+        streams,
+        routes,
+        offered_packets,
+        checked_mul(offered_packets, payload_bytes)?,
+        expected_deliveries,
+        checked_mul(expected_deliveries, payload_bytes)?,
+    )
+}
+
 fn video_plan(rooms: u32, peers: u32, publishers: u32, seconds: u32) -> Result<WorkloadPlan> {
     let rooms = u64::from(rooms);
     let peers = u64::from(peers);
@@ -527,6 +632,28 @@ fn video_plan(rooms: u32, peers: u32, publishers: u32, seconds: u32) -> Result<W
         offered_payload_bytes,
         expected_deliveries,
         expected_delivery_payload_bytes,
+    )
+}
+
+fn mixed_plan(
+    rooms: u32,
+    peers: u32,
+    audio_publishers: u32,
+    video_publishers: u32,
+    seconds: u32,
+) -> Result<WorkloadPlan> {
+    let audio = audio_plan(rooms, peers, audio_publishers, seconds)?;
+    let video = video_plan(rooms, peers, video_publishers, seconds)?;
+    WorkloadPlan::new(
+        checked_add(audio.streams, video.streams)?,
+        checked_add(audio.routes, video.routes)?,
+        checked_add(audio.offered_packets, video.offered_packets)?,
+        checked_add(audio.offered_payload_bytes, video.offered_payload_bytes)?,
+        checked_add(audio.expected_deliveries, video.expected_deliveries)?,
+        checked_add(
+            audio.expected_delivery_payload_bytes,
+            video.expected_delivery_payload_bytes,
+        )?,
     )
 }
 

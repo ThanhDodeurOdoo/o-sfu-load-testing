@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, VecDeque},
-    time::Duration,
+    sync::Arc,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -226,6 +227,10 @@ impl LoadPeer {
         self.rtc.reset_send_pacing();
     }
 
+    pub fn set_send_origin(&mut self, send_origin: Instant) {
+        self.rtc.set_send_origin(send_origin);
+    }
+
     pub async fn send_audio_packet(&mut self, packet: AudioPacket) -> Result<usize> {
         self.check_signaling().await?;
         let payload = self.rtc.send_audio_packet(packet).await?;
@@ -233,7 +238,10 @@ impl LoadPeer {
         Ok(payload)
     }
 
-    pub async fn read_rtp_payload(&mut self, timeout_window: Duration) -> Result<Option<Vec<u8>>> {
+    pub async fn read_rtp_payload(
+        &mut self,
+        timeout_window: Duration,
+    ) -> Result<Option<Arc<[u8]>>> {
         self.check_signaling().await?;
         let payload = self.rtc.read_rtp_payload(timeout_window).await?;
         self.check_signaling().await?;
