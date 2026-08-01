@@ -1041,6 +1041,13 @@ pub(crate) fn render_category_charts(
         series.iter().all(|line| line.values.len() == labels.len()),
         "chart series lengths must match chart labels"
     );
+    if labels.len() == 1 {
+        writeln!(
+            output,
+            "The {title} chart is omitted because fewer than two scenarios have chartable values. The tabular metrics remain available.\n"
+        )?;
+        return Ok(());
+    }
     if labels.len() > MAX_CHART_SCENARIOS {
         writeln!(
             output,
@@ -1123,16 +1130,14 @@ fn render_category_chart(
     series: &[ChartSeries<'_>],
 ) -> Result<()> {
     ensure!(
+        labels.len() >= 2,
+        "category line chart needs at least two labels"
+    );
+    ensure!(
         series.len() <= LINE_COLORS.len(),
         "chart has more lines than its color palette"
     );
     writeln!(output, "{description}\n")?;
-    if labels.len() == 1 {
-        writeln!(
-            output,
-            "The single value is repeated once so Mermaid draws a visible line segment.\n"
-        )?;
-    }
     write!(output, "Series colors: ")?;
     for (index, (line, (color, hex))) in series.iter().zip(LINE_COLORS).enumerate() {
         if index > 0 {
@@ -1164,21 +1169,11 @@ fn render_category_chart(
         }
         write!(output, "\"{label}\"")?;
     }
-    if labels.len() == 1 {
-        write!(output, ", \"\"")?;
-    }
     writeln!(output, "]")?;
     writeln!(output, "    y-axis \"{y_axis}\" 0 --> {maximum}")?;
     for line in series {
         write!(output, "    line [")?;
         write_values(output, line.values)?;
-        if line.values.len() == 1 {
-            write!(
-                output,
-                ", {}",
-                line.values.first().copied().unwrap_or_default()
-            )?;
-        }
         writeln!(output, "]")?;
     }
     writeln!(output, "```\n")?;
@@ -1197,6 +1192,13 @@ fn render_cpu_timeline_chart(
         values.len() <= CPU_TIMELINE_POINTS,
         "line chart exceeds the CPU timeline point limit"
     );
+    if values.len() == 1 {
+        writeln!(
+            output,
+            "The {title} chart is omitted because fewer than two telemetry buckets are available. The sampled value remains in the telemetry table.\n"
+        )?;
+        return Ok(());
+    }
     if values.iter().any(|value| *value > MAX_MERMAID_INTEGER) {
         writeln!(
             output,
@@ -1215,9 +1217,6 @@ fn render_cpu_timeline_chart(
     writeln!(output, "    y-axis \"CPU (%)\" 0 --> {maximum}")?;
     write!(output, "    line [")?;
     write_values(output, values)?;
-    if values.len() == 1 {
-        write!(output, ", {}", values.first().copied().unwrap_or_default())?;
-    }
     writeln!(output, "]")?;
     writeln!(output, "```\n")?;
     Ok(())
@@ -1535,6 +1534,53 @@ pub(crate) fn validate_artifact_url(artifact_url: Option<&str>) -> Result<()> {
         );
     }
     Ok(())
+}
+
+pub(crate) fn validate_flamegraph_url(flamegraph_url: Option<&str>) -> Result<()> {
+    if let Some(url) = flamegraph_url {
+        let parts = url
+            .strip_prefix("https://github.com/")
+            .map(|path| path.split('/').collect::<Vec<_>>());
+        let valid = parts.as_deref().is_some_and(|parts| {
+            let [
+                owner,
+                repository,
+                "releases",
+                "download",
+                "load-test-assets",
+                asset,
+            ] = parts
+            else {
+                return false;
+            };
+            valid_repository_component(owner)
+                && valid_repository_component(repository)
+                && valid_flamegraph_asset(asset)
+        });
+        ensure!(
+            valid,
+            "flamegraph URL must identify one published load-test PNG"
+        );
+    }
+    Ok(())
+}
+
+fn valid_flamegraph_asset(value: &str) -> bool {
+    let Some(ids) = value
+        .strip_prefix("o-sfu-flamegraph-")
+        .and_then(|value| value.strip_suffix(".png"))
+    else {
+        return false;
+    };
+    let ids = ids
+        .strip_prefix("baseline-")
+        .or_else(|| ids.strip_prefix("comparison-"))
+        .unwrap_or(ids);
+    let mut parts = ids.split('-');
+    let (Some(run_id), Some(attempt), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    numeric_identifier(run_id) && numeric_identifier(attempt)
 }
 
 fn valid_repository_component(value: &str) -> bool {

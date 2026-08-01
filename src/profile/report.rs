@@ -18,7 +18,7 @@ use super::{
 };
 use crate::report::{
     RunData, ensure_summary_size, escape_table, load_run, scenario_label, validate_artifact_url,
-    validate_run,
+    validate_flamegraph_url, validate_run,
 };
 
 const CAPTURE_LIMIT_BYTES: u64 = 64 * 1024;
@@ -276,7 +276,7 @@ pub fn render(
     flamegraph_url: Option<&str>,
 ) -> Result<String> {
     validate_artifact_url(artifact_url)?;
-    validate_artifact_url(flamegraph_url)?;
+    validate_flamegraph_url(flamegraph_url)?;
     let report = load_prepared(input)?;
     let mut output = String::new();
     render_overview(&mut output, &report, artifact_url, flamegraph_url)?;

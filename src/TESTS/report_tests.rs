@@ -4,7 +4,7 @@ use super::{
     ChartSeries, GITHUB_SUMMARY_LIMIT_BYTES, LoadFailure, RunData, SampleSet, TelemetrySummary,
     chart_axis_max, cpu_micros_per_million, cpu_series, delivery_rate, ensure_summary_size,
     escape_table, format_mebibytes, moving_average, parse_samples, render_category_charts,
-    render_report, validate_artifact_url,
+    render_report, validate_artifact_url, validate_flamegraph_url,
 };
 use crate::{ScenarioResult, ScenarioSpec};
 
@@ -66,7 +66,9 @@ fn report_marks_delivery_discrepancies_and_send_lag() -> anyhow::Result<()> {
     assert!(report.contains("| FAIL | 1 | 0 | n/a | deadbeef |"));
     assert!(report.contains("Performance samples: **INVALID**"));
     assert!(report.contains("| 37 ms |"));
-    assert!(report.contains("line [99, 99]"));
+    assert!(report.contains(
+        "The Observed receiver deliveries per second chart is omitted because fewer than two scenarios have chartable values. The tabular metrics remain available."
+    ));
     assert!(report.contains("| smoke-2r-50p | 100 | 99 | 99/s |"));
     assert!(report.contains("| smoke-2r-50p | 1 | 0 | 0 | 0 | 0 | 1 |"));
     Ok(())
@@ -141,10 +143,9 @@ not-json
     )?;
 
     assert!(report.contains("| smoke-1r-50p | 3 | 2 | 2,000 ms | yes | yes |"));
-    assert!(report.contains("title \"SFU CPU average and peak\""));
-    assert!(report.contains("y-axis \"CPU (%)\" 0 --> 100"));
-    assert!(report.contains("line [75, 75]"));
-    assert!(report.contains("line [100, 100]"));
+    assert!(report.contains(
+        "The SFU CPU average and peak chart is omitted because fewer than two scenarios have chartable values. The tabular metrics remain available."
+    ));
     assert!(report.contains("title \"SFU CPU timeline: smoke-1r-50p\""));
     assert!(report.contains("x-axis \"elapsed (s)\" 0 --> 1"));
     assert!(report.contains("line [75, 75]"));
@@ -201,7 +202,7 @@ fn telemetry_does_not_infer_cpu_percent_from_ticks() -> anyhow::Result<()> {
 }
 
 #[test]
-fn cpu_chart_keeps_scenarios_with_explicit_percent_samples() -> anyhow::Result<()> {
+fn cpu_chart_keeps_explicit_samples_and_omits_singleton_line() -> anyhow::Result<()> {
     let explicit = parse_samples(
         r#"
 {"elapsedMs":0,"server":{"rssBytes":1}}
@@ -222,9 +223,10 @@ fn cpu_chart_keeps_scenarios_with_explicit_percent_samples() -> anyhow::Result<(
         None,
     )?;
 
-    assert!(report.contains("title \"SFU CPU average and peak\""));
-    assert!(report.contains("x-axis [\"S 1r/50p\", \"\"]"));
-    assert_eq!(report.matches("line [10, 10]").count(), 3);
+    assert!(report.contains(
+        "The SFU CPU average and peak chart is omitted because fewer than two scenarios have chartable values. The tabular metrics remain available."
+    ));
+    assert!(!report.contains("title \"SFU CPU average and peak\""));
     assert!(report.contains(
         "CPU chart requires an interval-weighted average and sampled peak. Omitted scenarios: S 2r/50p."
     ));
@@ -243,7 +245,10 @@ fn cpu_chart_discloses_single_sample_omission() -> anyhow::Result<()> {
     assert!(report.contains(
         "CPU chart requires an interval-weighted average and sampled peak. Omitted scenarios: S 1r/50p."
     ));
-    assert!(report.contains("title \"SFU CPU timeline: smoke-1r-50p\""));
+    assert!(report.contains(
+        "The SFU CPU timeline: smoke-1r-50p chart is omitted because fewer than two telemetry buckets are available. The sampled value remains in the telemetry table."
+    ));
+    assert!(!report.contains("title \"SFU CPU timeline: smoke-1r-50p\""));
     Ok(())
 }
 
@@ -254,8 +259,9 @@ fn scheduled_sender_rate_excludes_receiver_drain_time() -> anyhow::Result<()> {
 
     let report = render_runs(vec![delayed], None)?;
 
-    assert!(report.contains("line [64, 64]"));
-    assert!(report.contains("line [32, 32]"));
+    assert!(report.contains(
+        "The Scheduled sender and receiver-observed RTP payload chart is omitted because fewer than two scenarios have chartable values. The tabular metrics remain available."
+    ));
     assert!(report.contains("| 64.0 kbit/s | 32.0 kbit/s |"));
     Ok(())
 }
@@ -325,10 +331,11 @@ fn rate_and_rss_formatting_do_not_overflow() -> anyhow::Result<()> {
     let mut maximum = run(ScenarioSpec::smoke(1, 1)?, None, 0)?;
     maximum.result.delivered_packets = u64::MAX;
     maximum.result.elapsed_ms = 1;
+    let ordinary = run(ScenarioSpec::smoke(2, 1)?, None, 0)?;
 
     assert_eq!(delivery_rate(&maximum.result), u64::MAX);
     assert_eq!(format_mebibytes(u64::MAX), "17592186044415.9 MiB");
-    let report = render_runs(vec![maximum], None)?;
+    let report = render_runs(vec![maximum, ordinary], None)?;
     assert!(
         report.contains("chart is omitted because a value exceeds Mermaid's exact-integer range")
     );
@@ -442,6 +449,34 @@ fn artifact_link_accepts_only_one_github_actions_artifact() {
         .is_err()
     );
     assert!(validate_artifact_url(Some("https://github.com/example/repo\nunsafe")).is_err());
+}
+
+#[test]
+fn flamegraph_link_accepts_only_one_load_test_release_asset() {
+    assert!(
+        validate_flamegraph_url(Some(
+            "https://github.com/example/repo/releases/download/load-test-assets/o-sfu-flamegraph-1-2.png"
+        ))
+        .is_ok()
+    );
+    assert!(
+        validate_flamegraph_url(Some(
+            "https://github.com/example/repo/releases/download/load-test-assets/o-sfu-flamegraph-baseline-1-2.png"
+        ))
+        .is_ok()
+    );
+    assert!(
+        validate_flamegraph_url(Some(
+            "https://github.com/example/repo/releases/download/other/o-sfu-flamegraph-1-2.png"
+        ))
+        .is_err()
+    );
+    assert!(
+        validate_flamegraph_url(Some(
+            "https://github.com/example/repo/releases/download/load-test-assets/o-sfu-flamegraph-1-2.png?q=unsafe"
+        ))
+        .is_err()
+    );
 }
 
 fn run(

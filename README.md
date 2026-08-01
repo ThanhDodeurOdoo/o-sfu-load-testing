@@ -95,6 +95,9 @@ scheduled sender RTP payload versus receiver-observed payload plus SFU CPU
 average, peak and timeline data. Category charts contain at most four scenarios
 per panel and use compact labels. Scenarios within each workload family are
 ordered by planned load. Every panel declares its independent y-axis scale.
+Single-scenario category charts are omitted because their exact table value
+does not define a line. Telemetry timelines remain available when at least two
+buckets were observed.
 The CPU timeline groups real samples into at most 32 equal elapsed-time buckets
 then applies a centered five-bucket moving average. The bucket count shrinks
 when needed so a scrape gap is not filled with invented data. Bucket values and
@@ -138,12 +141,14 @@ The postprocessor expects `perf`, `inferno-collapse-perf` and
 The flamegraph, `perf.data`, folded stacks, profiled server binary and raw perf
 reports are retained in the workflow artifact. The profile summary also records
 the runner CPU model, logical CPU count, kernel, tool versions and maximum stack
-depth. GitHub Actions uploads a PNG flamegraph preview as an unarchived image
-artifact so the job summary embeds it directly for signed-in viewers. The
-complete artifact retains the interactive SVG, ranked breakdown and raw
-evidence. If the hosted runner denies
-performance-counter access then the ordinary load report remains valid and the
-profile section records that profiling was unavailable.
+depth. A separate publisher job validates each PNG preview and uploads it as a
+run-specific asset on the `load-test-assets` prerelease. This gives the job
+summary a public image URL without granting write access to the load process.
+Later publisher runs remove preview assets older than 30 days. The complete
+workflow artifact retains the interactive SVG, ranked breakdown and raw
+evidence. If the hosted runner denies performance-counter access then the
+ordinary load report remains valid and the profile section records that
+profiling was unavailable.
 
 Profiling is a qualitative diagnostic replay. Debug information plus frame
 pointers and sampling affect that replay so its timings are excluded from the

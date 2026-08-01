@@ -23,6 +23,10 @@ concurrency:
 
 jobs:
   load:
+    outputs:
+      profile_summary_artifact_id: ${{ steps.profile-summary-artifact.outputs.artifact-id }}
+      profile_summary_artifact_name: ${{ steps.profile-summary.outputs.artifact_name }}
+      profile_summary_attempt: ${{ steps.profile-summary.outputs.run_attempt }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
 
@@ -417,13 +421,26 @@ jobs:
             fi
           }
 
+          render_preview() {
+            local source=$1
+            local output=$2
+            local temporary="${output}.tmp"
+            if rsvg-convert --width 1800 \
+              --output "$temporary" "$source"; then
+              mv "$temporary" "$output"
+            else
+              rm -f "$temporary"
+              return 1
+            fi
+          }
+
           if [[ "$MODE" == single ]]; then
             capture_with_log target target/profile \
               artifacts/profile/audio-1x28 Cargo.lock || status=1
             if [[ -s artifacts/profile/audio-1x28/profile.ready ]]; then
-              rsvg-convert --width 1800 \
-                --output artifacts/o-sfu-flamegraph.png \
-                artifacts/profile/audio-1x28/flamegraph.svg || status=1
+              render_preview \
+                artifacts/profile/audio-1x28/flamegraph.svg \
+                artifacts/o-sfu-flamegraph.png || status=1
             fi
           else
             capture_with_log target/baseline target/profile-baseline \
@@ -433,45 +450,18 @@ jobs:
               artifacts/profile/comparison/audio-1x28 \
               artifacts/comparison/Cargo.lock || status=1
             if [[ -s artifacts/profile/baseline/audio-1x28/profile.ready ]]; then
-              rsvg-convert --width 1800 \
-                --output artifacts/o-sfu-flamegraph-baseline.png \
-                artifacts/profile/baseline/audio-1x28/flamegraph.svg || status=1
+              render_preview \
+                artifacts/profile/baseline/audio-1x28/flamegraph.svg \
+                artifacts/o-sfu-flamegraph-baseline.png || status=1
             fi
             if [[ -s artifacts/profile/comparison/audio-1x28/profile.ready ]]; then
-              rsvg-convert --width 1800 \
-                --output artifacts/o-sfu-flamegraph-comparison.png \
-                artifacts/profile/comparison/audio-1x28/flamegraph.svg || status=1
+              render_preview \
+                artifacts/profile/comparison/audio-1x28/flamegraph.svg \
+                artifacts/o-sfu-flamegraph-comparison.png || status=1
             fi
           fi
 
           exit "$status"
-
-      - name: Upload CPU flamegraph preview
-        id: flamegraph
-        if: always() && steps.revisions.outputs.mode == 'single' && hashFiles('artifacts/o-sfu-flamegraph.png') != ''
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          path: artifacts/o-sfu-flamegraph.png
-          archive: false
-          retention-days: 30
-
-      - name: Upload baseline CPU flamegraph preview
-        id: flamegraph-baseline
-        if: always() && steps.revisions.outputs.mode == 'comparison' && hashFiles('artifacts/o-sfu-flamegraph-baseline.png') != ''
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          path: artifacts/o-sfu-flamegraph-baseline.png
-          archive: false
-          retention-days: 30
-
-      - name: Upload comparison CPU flamegraph preview
-        id: flamegraph-comparison
-        if: always() && steps.revisions.outputs.mode == 'comparison' && hashFiles('artifacts/o-sfu-flamegraph-comparison.png') != ''
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          path: artifacts/o-sfu-flamegraph-comparison.png
-          archive: false
-          retention-days: 30
 
       - name: Upload load artifacts
         id: load-artifact
@@ -543,7 +533,8 @@ jobs:
 
           cat "$summary" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Publish CPU profile summary
+      - name: Prepare CPU profile summary
+        id: profile-summary
         if: always()
         env:
           ARTIFACT_URL: ${{ steps.load-artifact.outputs.artifact-url }}
@@ -551,12 +542,32 @@ jobs:
           PROFILER_AVAILABLE: ${{ steps.profiler.outputs.available }}
           PROFILE_BUILD_OUTCOME: ${{ steps.profile-build.outcome }}
           PROFILE_RUN_OUTCOME: ${{ steps.cpu-profile.outcome }}
-          FLAMEGRAPH_URL: ${{ steps.flamegraph.outputs.artifact-url }}
-          BASELINE_FLAMEGRAPH_URL: ${{ steps.flamegraph-baseline.outputs.artifact-url }}
-          COMPARISON_FLAMEGRAPH_URL: ${{ steps.flamegraph-comparison.outputs.artifact-url }}
+          RELEASE_URL: https://github.com/${{ github.repository }}/releases/download/load-test-assets
         run: |
-          set -uo pipefail
+          set -euo pipefail
           mkdir -p artifacts
+          publication=artifacts/profile-publication.md
+          : > "$publication"
+          handoff_name="profile-summary-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          single_asset="o-sfu-flamegraph-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.png"
+          baseline_asset="o-sfu-flamegraph-baseline-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.png"
+          comparison_asset="o-sfu-flamegraph-comparison-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.png"
+          single_url=
+          baseline_url=
+          comparison_url=
+          if [[ -s artifacts/o-sfu-flamegraph.png ]]; then
+            cp artifacts/o-sfu-flamegraph.png "artifacts/$single_asset"
+            single_url="$RELEASE_URL/$single_asset"
+          fi
+          if [[ -s artifacts/o-sfu-flamegraph-baseline.png ]]; then
+            cp artifacts/o-sfu-flamegraph-baseline.png "artifacts/$baseline_asset"
+            baseline_url="$RELEASE_URL/$baseline_asset"
+          fi
+          if [[ -s artifacts/o-sfu-flamegraph-comparison.png ]]; then
+            cp artifacts/o-sfu-flamegraph-comparison.png "artifacts/$comparison_asset"
+            comparison_url="$RELEASE_URL/$comparison_asset"
+          fi
 
           publish_profile() {
             local reporter=$1
@@ -578,13 +589,15 @@ jobs:
             if [[ -x "$reporter" && -s "$input/profile.ready" ]] && \
               "$reporter" "${args[@]}"; then
               if [[ -n "$heading" ]]; then
-                {
-                  echo "$heading"
-                  echo
-                  tail -n +2 "$summary"
-                } >> "$GITHUB_STEP_SUMMARY"
+                echo "$heading" >> "$publication"
+                echo >> "$publication"
+                if [[ "$heading" == '## '* ]]; then
+                  sed -e '1d' -e 's/^## /### /' "$summary" >> "$publication"
+                else
+                  tail -n +2 "$summary" >> "$publication"
+                fi
               else
-                cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+                cat "$summary" >> "$publication"
               fi
               return
             fi
@@ -597,31 +610,219 @@ jobs:
               echo
               echo 'The artifact retains profiler diagnostics when capture was attempted.'
               echo
-            } >> "$GITHUB_STEP_SUMMARY"
+            } >> "$publication"
           }
 
           if [[ "$MODE" == comparison ]]; then
             {
               echo '# o-sfu CPU profiles'
               echo
-            } >> "$GITHUB_STEP_SUMMARY"
+            } >> "$publication"
             publish_profile \
               target/baseline/release/o-sfu-load-profile \
               artifacts/profile/baseline/audio-1x28 \
               '## Baseline revision' \
               artifacts/profile-baseline-summary.md \
-              "$BASELINE_FLAMEGRAPH_URL"
+              "$baseline_url"
             publish_profile \
               target/comparison/release/o-sfu-load-profile \
               artifacts/profile/comparison/audio-1x28 \
               '## Comparison revision' \
               artifacts/profile-comparison-summary.md \
-              "$COMPARISON_FLAMEGRAPH_URL"
+              "$comparison_url"
           else
             publish_profile \
               target/release/o-sfu-load-profile \
               artifacts/profile/audio-1x28 \
               '# o-sfu CPU profile' \
               artifacts/profile-summary.md \
-              "$FLAMEGRAPH_URL"
+              "$single_url"
           fi
+          echo "artifact_name=$handoff_name" >> "$GITHUB_OUTPUT"
+          echo "run_attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+
+      - name: Upload CPU profile summary handoff
+        id: profile-summary-artifact
+        if: always() && hashFiles('artifacts/profile-publication.md') != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ${{ steps.profile-summary.outputs.artifact_name }}
+          path: |
+            artifacts/profile-publication.md
+            artifacts/o-sfu-flamegraph-${{ github.run_id }}-${{ github.run_attempt }}.png
+            artifacts/o-sfu-flamegraph-baseline-${{ github.run_id }}-${{ github.run_attempt }}.png
+            artifacts/o-sfu-flamegraph-comparison-${{ github.run_id }}-${{ github.run_attempt }}.png
+          if-no-files-found: error
+          retention-days: 30
+
+  publish-profile:
+    name: Publish CPU profile summary
+    needs: load
+    if: ${{ always() && needs.load.outputs.profile_summary_artifact_id != '' }}
+    permissions:
+      actions: read
+      contents: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Download CPU profile summary handoff
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HANDOFF_NAME: ${{ needs.load.outputs.profile_summary_artifact_name }}
+        run: |
+          set -euo pipefail
+          gh run download "$GITHUB_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "$HANDOFF_NAME" \
+            --dir handoff
+
+      - name: Publish public flamegraph previews
+        id: flamegraph-publication
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROFILE_ATTEMPT: ${{ needs.load.outputs.profile_summary_attempt }}
+        run: |
+          set -euo pipefail
+          summary=handoff/profile-publication.md
+          [[ -s "$summary" ]] || {
+            echo 'The CPU profile summary handoff is empty.' >&2
+            exit 1
+          }
+
+          shopt -s nullglob
+          pngs=(handoff/o-sfu-flamegraph-*.png)
+
+          single="o-sfu-flamegraph-${GITHUB_RUN_ID}-${PROFILE_ATTEMPT}.png"
+          baseline="o-sfu-flamegraph-baseline-${GITHUB_RUN_ID}-${PROFILE_ATTEMPT}.png"
+          comparison="o-sfu-flamegraph-comparison-${GITHUB_RUN_ID}-${PROFILE_ATTEMPT}.png"
+          for file in "${pngs[@]}"; do
+            name=${file##*/}
+            case "$name" in
+              "$single"|"$baseline"|"$comparison") ;;
+              *)
+                echo "Unexpected flamegraph asset: $name" >&2
+                exit 1
+                ;;
+            esac
+            signature=$(od -An -tx1 -N8 "$file" | tr -d '[:space:]')
+            [[ "$signature" == 89504e470d0a1a0a ]] || {
+              echo "$name is not a PNG." >&2
+              exit 1
+            }
+            size=$(stat -c %s "$file")
+            (( size >= 1024 && size <= 10485760 )) || {
+              echo "$name has an unexpected size: $size bytes" >&2
+              exit 1
+            }
+          done
+
+          release=load-test-assets
+          release_response="$RUNNER_TEMP/load-test-assets.json"
+          release_status=$(curl --silent --show-error \
+            --output "$release_response" \
+            --write-out '%{http_code}' \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/$release")
+          case "$release_status" in
+            200)
+              release_id=$(jq -er '.id | numbers' "$release_response")
+              ;;
+            404)
+              if (( ${#pngs[@]} == 0 )); then
+                exit 0
+              fi
+              gh release create "$release" \
+                --repo "$GITHUB_REPOSITORY" \
+                --target "$GITHUB_SHA" \
+                --title 'Nightly load-test visuals' \
+                --notes 'Run-specific previews for GitHub Actions summaries. Later runs remove assets older than 30 days.' \
+                --prerelease \
+                --latest=false
+              release_id=$(gh api \
+                "repos/${GITHUB_REPOSITORY}/releases/tags/$release" \
+                --jq .id)
+              ;;
+            *)
+              echo "GitHub returned HTTP $release_status while resolving the preview release." >&2
+              exit 1
+              ;;
+          esac
+
+          cutoff=$(date -u -d '30 days ago' +%s)
+          asset_rows=$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/releases/$release_id/assets?per_page=100" \
+            --jq '.[] | [.id, .name, .created_at] | @tsv')
+          while IFS=$'\t' read -r asset_id name created_at; do
+            if [[ ! "$name" =~ ^o-sfu-flamegraph(-(baseline|comparison))?-[0-9]+-[0-9]+\.png$ ]]; then
+              continue
+            fi
+            created=$(date -u -d "$created_at" +%s)
+            if (( created < cutoff )); then
+              gh api --method DELETE \
+                "repos/${GITHUB_REPOSITORY}/releases/assets/$asset_id"
+            fi
+          done <<< "$asset_rows"
+
+          for file in "${pngs[@]}"; do
+            name=${file##*/}
+            url="https://github.com/${GITHUB_REPOSITORY}/releases/download/$release/$name"
+            uploaded=false
+            matching_assets=$(gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/releases/$release_id/assets?per_page=100" \
+              --jq ".[] | select(.name == \"$name\") | [.id, .state] | @tsv")
+            while IFS=$'\t' read -r asset_id state; do
+              [[ -n "$asset_id" ]] || continue
+              case "$state" in
+                starter)
+                  gh api --method DELETE \
+                    "repos/${GITHUB_REPOSITORY}/releases/assets/$asset_id"
+                  ;;
+                uploaded)
+                  uploaded=true
+                  ;;
+                *)
+                  echo "$name has an unexpected release asset state: $state" >&2
+                  exit 1
+                  ;;
+              esac
+            done <<< "$matching_assets"
+            if [[ "$uploaded" == false ]]; then
+              gh release upload "$release" "$file" --repo "$GITHUB_REPOSITORY"
+            fi
+            downloaded="$RUNNER_TEMP/$name"
+            curl --fail --silent --show-error --location \
+              --retry 5 --retry-all-errors --retry-delay 2 \
+              --output "$downloaded" "$url"
+            cmp --silent "$file" "$downloaded" || {
+              echo "$name differs from its public release asset." >&2
+              exit 1
+            }
+          done
+
+      - name: Publish CPU profile summary
+        if: always()
+        env:
+          FLAMEGRAPH_PUBLICATION: ${{ steps.flamegraph-publication.outcome }}
+        run: |
+          set -euo pipefail
+          summary=handoff/profile-publication.md
+          if [[ ! -s "$summary" ]]; then
+            echo '# o-sfu CPU profile' >> "$GITHUB_STEP_SUMMARY"
+            echo >> "$GITHUB_STEP_SUMMARY"
+            echo 'The profile summary handoff is unavailable.' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          if [[ "$FLAMEGRAPH_PUBLICATION" != success ]]; then
+            echo '> Flamegraph preview publication failed. The profile breakdown remains valid. Use the workflow artifact for the interactive SVG.' >> "$GITHUB_STEP_SUMMARY"
+            echo >> "$GITHUB_STEP_SUMMARY"
+            sed \
+              -e '/^\[!\[o-sfu CPU flamegraph\]/d' \
+              -e '/^The embedded PNG is a static preview\./d' \
+              "$summary" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          cat "$summary" >> "$GITHUB_STEP_SUMMARY"

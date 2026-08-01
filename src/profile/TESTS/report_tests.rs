@@ -184,7 +184,7 @@ fn profile_summary_explains_overlapping_costs_and_raw_evidence() -> anyhow::Resu
     }
 
     let artifact_url = "https://github.com/example/repo/actions/runs/1/artifacts/2";
-    let flamegraph_url = "https://github.com/example/repo/actions/runs/1/artifacts/3";
+    let flamegraph_url = "https://github.com/example/repo/releases/download/load-test-assets/o-sfu-flamegraph-1-1.png";
     let summary = super::render(&directory, Some(artifact_url), Some(flamegraph_url))?;
 
     assert!(summary.contains("| AVAILABLE | PASS | smoke-1r-50p |"));

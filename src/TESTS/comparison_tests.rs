@@ -22,16 +22,14 @@ fn comparison_renders_revision_lines_and_deltas() -> anyhow::Result<()> {
     assert!(report.contains(COMPARISON_REVISION));
     assert!(report.contains("| Scenario | Profile | Expected deliveries | Duration |"));
     assert!(!report.contains("| Scenario | Profile | Expected deliveries | Duration | Contract |"));
-    assert!(report.contains("title \"Receiver delivery throughput\""));
-    assert!(report.contains("x-axis [\"S 1r/50p\", \"\"]"));
-    assert!(
-        report.contains(
-            "Series colors: Blue (`#388BFD`) = baseline. Orange (`#B86E00`) = comparison."
-        )
-    );
-    assert!(report.contains("    line [50, 50]\n    line [50, 50]"));
+    assert!(report.contains(
+        "The Receiver delivery throughput chart is omitted because fewer than two scenarios have chartable values. The tabular metrics remain available."
+    ));
+    assert!(!report.contains("title \"Receiver delivery throughput\""));
     assert!(!report.contains("    bar ["));
-    assert!(report.contains("title \"SFU CPU time per million deliveries\""));
+    assert!(report.contains(
+        "The SFU CPU time per million deliveries chart is omitted because fewer than two scenarios have chartable values. The tabular metrics remain available."
+    ));
     assert!(report.contains("2,000.000000 CPU s/1M"));
     assert!(report.contains("1,000.000000 CPU s/1M"));
     assert!(report.contains("-1,000.000000 CPU s/1M (-50.0%)"));
