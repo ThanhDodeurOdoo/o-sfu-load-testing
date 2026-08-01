@@ -359,7 +359,7 @@ impl PeerMedia {
             .map(VideoSource::next_emitted_at);
         match (audio_due, video_due) {
             (Some(audio), Some(video)) if audio <= video => Some(MediaTurn::Audio),
-            (Some(_), Some(_)) | (None, Some(_)) => Some(MediaTurn::Video),
+            (Some(_) | None, Some(_)) => Some(MediaTurn::Video),
             (Some(_), None) => Some(MediaTurn::Audio),
             (None, None) => None,
         }
