@@ -37,12 +37,6 @@ receiver selects one RID. For example, 10 audio publishers among 60 total peers
 create `10 × (60 - 1) = 590` consumers. The count would be 600 only for 60
 listeners separate from the 10 publishers.
 
-[mediasoup documents](https://mediasoup.org/documentation/v3/scalability/)
-that one single-core worker typically handles over roughly 500 consumers
-depending on host CPU capability. This is topology context rather than a
-portable capacity threshold. CPU, media rates, packets per second and protocol
-work all affect the actual limit.
-
 ### Media units
 
 The fixed sizes approximate average active-media output. They are deterministic
