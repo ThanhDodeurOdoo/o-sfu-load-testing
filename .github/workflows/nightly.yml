@@ -24,9 +24,10 @@ concurrency:
 jobs:
   load:
     outputs:
-      profile_summary_artifact_id: ${{ steps.profile-summary-artifact.outputs.artifact-id }}
-      profile_summary_artifact_name: ${{ steps.profile-summary.outputs.artifact_name }}
-      profile_summary_attempt: ${{ steps.profile-summary.outputs.run_attempt }}
+      summary_artifact_id: ${{ steps.summary-artifact.outputs.artifact-id }}
+      summary_artifact_name: ${{ steps.summary-handoff.outputs.artifact_name }}
+      summary_attempt: ${{ steps.summary-handoff.outputs.run_attempt }}
+      load_mode: ${{ steps.revisions.outputs.mode }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
 
@@ -183,7 +184,8 @@ jobs:
             local target_directory=$1
             local output=$2
             shift 2
-            if ! "$target_directory/release/o-sfu-load" \
+            if ! taskset --cpu-list 1-3 \
+              "$target_directory/release/o-sfu-load" \
               --server-binary "$target_directory/release/o-sfu-load-server" \
               --rtc-binary "$target_directory/release/o-sfu-load-rtc" \
               --server-cpus 0 \
@@ -231,6 +233,87 @@ jobs:
           fi
 
           exit "$status"
+
+      - name: Render telemetry dashboards
+        id: dashboards
+        if: always()
+        continue-on-error: true
+        env:
+          MODE: ${{ steps.revisions.outputs.mode }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$MODE" == comparison ]]; then
+            reporter=target/baseline/release/o-sfu-load-report
+          else
+            reporter=target/release/o-sfu-load-report
+          fi
+          [[ -x "$reporter" ]] || {
+            echo 'The load reporter is unavailable.' >&2
+            exit 1
+          }
+
+          if ! command -v rsvg-convert > /dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y librsvg2-bin
+          fi
+          rsvg-convert --version
+
+          dashboard_directory=artifacts/dashboards
+          asset_stem="o-sfu-telemetry-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          temporary_summary="$RUNNER_TEMP/o-sfu-dashboard-preparation.md"
+          args=(
+            --output "$temporary_summary"
+            --dashboard-output "$dashboard_directory"
+            --dashboard-asset-stem "$asset_stem"
+          )
+          if [[ "$MODE" == comparison ]]; then
+            args+=(
+              --baseline-input artifacts/baseline/audio-1x8
+              --baseline-input artifacts/baseline/audio-2x12
+              --baseline-input artifacts/baseline/audio-3x12
+              --baseline-input artifacts/baseline/audio-1x28
+              --baseline-input artifacts/baseline/video-1x12
+              --baseline-input artifacts/baseline/video-1x64
+              --comparison-input artifacts/comparison/audio-1x8
+              --comparison-input artifacts/comparison/audio-2x12
+              --comparison-input artifacts/comparison/audio-3x12
+              --comparison-input artifacts/comparison/audio-1x28
+              --comparison-input artifacts/comparison/video-1x12
+              --comparison-input artifacts/comparison/video-1x64
+            )
+          else
+            args+=(
+              --input artifacts/audio-1x8
+              --input artifacts/audio-2x12
+              --input artifacts/audio-3x12
+              --input artifacts/audio-1x28
+              --input artifacts/video-1x12
+              --input artifacts/video-1x64
+            )
+          fi
+          "$reporter" "${args[@]}"
+
+          shopt -s nullglob
+          svgs=("$dashboard_directory"/*.svg)
+          (( ${#svgs[@]} > 0 )) || {
+            echo 'No telemetry dashboard SVG was generated.' >&2
+            exit 1
+          }
+          for source in "${svgs[@]}"; do
+            [[ -f "$source" && ! -L "$source" ]] || {
+              echo "Dashboard source is not a regular file: $source" >&2
+              exit 1
+            }
+            output=${source%.svg}.png
+            temporary="${output}.tmp"
+            if rsvg-convert --width 1800 --output "$temporary" "$source"; then
+              mv "$temporary" "$output"
+            else
+              rm -f "$temporary"
+              exit 1
+            fi
+          done
 
       - name: Prepare CPU profiler
         id: profiler
@@ -478,23 +561,33 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-      - name: Publish load summary
+      - name: Prepare load summaries
+        id: load-summaries
         if: always()
         env:
           ARTIFACT_URL: ${{ steps.load-artifact.outputs.artifact-url }}
+          DASHBOARD_OUTCOME: ${{ steps.dashboards.outcome }}
           MODE: ${{ steps.revisions.outputs.mode }}
+          RELEASE_URL: https://github.com/${{ github.repository }}/releases/download/load-test-assets
         run: |
+          set -euo pipefail
           mkdir -p artifacts
-          summary=artifacts/summary.md
+          fallback=artifacts/load-summary-fallback.md
+          publication=artifacts/load-publication.md
+          dashboard_directory=artifacts/dashboards
+          asset_stem="o-sfu-telemetry-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           if [[ "$MODE" == comparison ]]; then
             reporter=target/baseline/release/o-sfu-load-report
           else
             reporter=target/release/o-sfu-load-report
           fi
 
-          if [[ -x "$reporter" ]]; then
+          run_report() {
+            local output=$1
+            local dashboard_mode=$2
+            local args=(--output "$output")
             if [[ "$MODE" == comparison ]]; then
-              args=(
+              args+=(
                 --baseline-input artifacts/baseline/audio-1x8
                 --baseline-input artifacts/baseline/audio-2x12
                 --baseline-input artifacts/baseline/audio-3x12
@@ -507,37 +600,69 @@ jobs:
                 --comparison-input artifacts/comparison/audio-1x28
                 --comparison-input artifacts/comparison/video-1x12
                 --comparison-input artifacts/comparison/video-1x64
-                --output "$summary"
               )
             else
-              args=(
+              args+=(
                 --input artifacts/audio-1x8
                 --input artifacts/audio-2x12
                 --input artifacts/audio-3x12
                 --input artifacts/audio-1x28
                 --input artifacts/video-1x12
                 --input artifacts/video-1x64
-                --output "$summary"
               )
             fi
             if [[ -n "$ARTIFACT_URL" ]]; then
               args+=(--artifact-url "$ARTIFACT_URL")
             fi
+            if [[ "$dashboard_mode" != none ]]; then
+              args+=(
+                --dashboard-output "$dashboard_directory"
+                --dashboard-asset-stem "$asset_stem"
+              )
+              if [[ "$dashboard_mode" == public ]]; then
+                args+=(--dashboard-url-base "$RELEASE_URL")
+              fi
+            fi
             "$reporter" "${args[@]}"
-          elif [[ "$MODE" == comparison ]]; then
-            echo '# o-sfu revision comparison' > "$summary"
-            echo >> "$summary"
-            echo 'No comparison result was available.' >> "$summary"
-          else
-            echo '# o-sfu load report' > "$summary"
-            echo >> "$summary"
-            echo 'No load scenario produced a result.' >> "$summary"
+          }
+
+          write_minimal_fallback() {
+            if [[ "$MODE" == comparison ]]; then
+              echo '# o-sfu revision comparison' > "$fallback"
+              echo >> "$fallback"
+              echo 'No comparison result was available.' >> "$fallback"
+            else
+              echo '# o-sfu load report' > "$fallback"
+              echo >> "$fallback"
+              echo 'No load scenario produced a result.' >> "$fallback"
+            fi
+          }
+
+          stage_dashboards() {
+            shopt -s nullglob
+            local pngs=("$dashboard_directory"/*.png)
+            (( ${#pngs[@]} > 0 )) || return 1
+            mkdir -p artifacts/publication || return 1
+            local png
+            for png in "${pngs[@]}"; do
+              cp "$png" artifacts/publication/ || return 1
+            done
+          }
+
+          if [[ ! -x "$reporter" ]] || ! run_report "$fallback" none; then
+            write_minimal_fallback
+          fi
+          cp "$fallback" "$publication"
+
+          if [[ "$DASHBOARD_OUTCOME" == success && -x "$reporter" ]]; then
+            if ! run_report "$publication" public || ! stage_dashboards; then
+              echo '::warning::The public telemetry dashboard summary could not be rendered.'
+              cp "$fallback" "$publication"
+            fi
           fi
 
-          cat "$summary" >> "$GITHUB_STEP_SUMMARY"
-
       - name: Prepare CPU profile summary
-        id: profile-summary
+        id: summary-handoff
         if: always()
         env:
           ARTIFACT_URL: ${{ steps.load-artifact.outputs.artifact-url }}
@@ -551,7 +676,7 @@ jobs:
           mkdir -p artifacts
           publication=artifacts/profile-publication.md
           : > "$publication"
-          handoff_name="profile-summary-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          handoff_name="load-summary-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
 
           single_asset="o-sfu-flamegraph-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.png"
           baseline_asset="o-sfu-flamegraph-baseline-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.png"
@@ -644,24 +769,46 @@ jobs:
           echo "artifact_name=$handoff_name" >> "$GITHUB_OUTPUT"
           echo "run_attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
 
-      - name: Upload CPU profile summary handoff
-        id: profile-summary-artifact
-        if: always() && hashFiles('artifacts/profile-publication.md') != ''
+      - name: Upload load summary handoff
+        id: summary-artifact
+        if: always() && hashFiles('artifacts/load-publication.md') != ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: ${{ steps.profile-summary.outputs.artifact_name }}
+          name: ${{ steps.summary-handoff.outputs.artifact_name }}
           path: |
+            artifacts/load-publication.md
+            artifacts/load-summary-fallback.md
             artifacts/profile-publication.md
+            artifacts/publication/o-sfu-telemetry-${{ github.run_id }}-${{ github.run_attempt }}-*.png
             artifacts/o-sfu-flamegraph-${{ github.run_id }}-${{ github.run_attempt }}.png
             artifacts/o-sfu-flamegraph-baseline-${{ github.run_id }}-${{ github.run_attempt }}.png
             artifacts/o-sfu-flamegraph-comparison-${{ github.run_id }}-${{ github.run_attempt }}.png
           if-no-files-found: error
           retention-days: 30
 
-  publish-profile:
-    name: Publish CPU profile summary
+      - name: Publish local summary fallback
+        if: always() && steps.summary-artifact.outcome != 'success'
+        run: |
+          set -euo pipefail
+          if [[ -s artifacts/load-summary-fallback.md ]]; then
+            cat artifacts/load-summary-fallback.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '# o-sfu load report' >> "$GITHUB_STEP_SUMMARY"
+            echo >> "$GITHUB_STEP_SUMMARY"
+            echo 'The load summary handoff is unavailable.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [[ -s artifacts/profile-publication.md ]]; then
+            echo >> "$GITHUB_STEP_SUMMARY"
+            sed \
+              -e '/^\[!\[o-sfu CPU flamegraph\]/d' \
+              -e '/^The embedded PNG is a static preview\./d' \
+              artifacts/profile-publication.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  publish-results:
+    name: Publish load summaries
     needs: load
-    if: ${{ always() && needs.load.outputs.profile_summary_artifact_id != '' }}
+    if: ${{ always() && needs.load.outputs.summary_artifact_id != '' }}
     permissions:
       actions: read
       contents: write
@@ -669,10 +816,10 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - name: Download CPU profile summary handoff
+      - name: Download load summary handoff
         env:
           GH_TOKEN: ${{ github.token }}
-          HANDOFF_NAME: ${{ needs.load.outputs.profile_summary_artifact_name }}
+          HANDOFF_NAME: ${{ needs.load.outputs.summary_artifact_name }}
         run: |
           set -euo pipefail
           gh run download "$GITHUB_RUN_ID" \
@@ -680,46 +827,33 @@ jobs:
             --name "$HANDOFF_NAME" \
             --dir handoff
 
-      - name: Publish public flamegraph previews
-        id: flamegraph-publication
+      - name: Prepare public preview release
+        id: preview-release
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
-          PROFILE_ATTEMPT: ${{ needs.load.outputs.profile_summary_attempt }}
+          MODE: ${{ needs.load.outputs.load_mode }}
+          SUMMARY_ATTEMPT: ${{ needs.load.outputs.summary_attempt }}
         run: |
           set -euo pipefail
-          summary=handoff/profile-publication.md
-          [[ -s "$summary" ]] || {
-            echo 'The CPU profile summary handoff is empty.' >&2
+          [[ -s handoff/load-publication.md ]] || {
+            echo 'The load summary handoff is empty.' >&2
+            exit 1
+          }
+          [[ "$MODE" == single || "$MODE" == comparison ]] || {
+            echo "Unexpected load mode: $MODE" >&2
+            exit 1
+          }
+          [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ && "$SUMMARY_ATTEMPT" =~ ^[0-9]+$ ]] || {
+            echo 'The run ID and attempt must be numeric.' >&2
             exit 1
           }
 
-          shopt -s nullglob
-          pngs=(handoff/o-sfu-flamegraph-*.png)
-
-          single="o-sfu-flamegraph-${GITHUB_RUN_ID}-${PROFILE_ATTEMPT}.png"
-          baseline="o-sfu-flamegraph-baseline-${GITHUB_RUN_ID}-${PROFILE_ATTEMPT}.png"
-          comparison="o-sfu-flamegraph-comparison-${GITHUB_RUN_ID}-${PROFILE_ATTEMPT}.png"
-          for file in "${pngs[@]}"; do
-            name=${file##*/}
-            case "$name" in
-              "$single"|"$baseline"|"$comparison") ;;
-              *)
-                echo "Unexpected flamegraph asset: $name" >&2
-                exit 1
-                ;;
-            esac
-            signature=$(od -An -tx1 -N8 "$file" | tr -d '[:space:]')
-            [[ "$signature" == 89504e470d0a1a0a ]] || {
-              echo "$name is not a PNG." >&2
-              exit 1
-            }
-            size=$(stat -c %s "$file")
-            (( size >= 1024 && size <= 10485760 )) || {
-              echo "$name has an unexpected size: $size bytes" >&2
-              exit 1
-            }
-          done
+          shopt -s globstar nullglob
+          dashboard_pngs=(
+            handoff/**/o-sfu-telemetry-"${GITHUB_RUN_ID}"-"${SUMMARY_ATTEMPT}"-*.png
+          )
+          flamegraph_pngs=(handoff/**/o-sfu-flamegraph-*.png)
 
           release=load-test-assets
           release_response="$RUNNER_TEMP/load-test-assets.json"
@@ -735,7 +869,8 @@ jobs:
               release_id=$(jq -er '.id | numbers' "$release_response")
               ;;
             404)
-              if (( ${#pngs[@]} == 0 )); then
+              if (( ${#dashboard_pngs[@]} == 0 && ${#flamegraph_pngs[@]} == 0 )); then
+                echo 'release_id=' >> "$GITHUB_OUTPUT"
                 exit 0
               fi
               gh release create "$release" \
@@ -754,13 +889,18 @@ jobs:
               exit 1
               ;;
           esac
+          [[ "$release_id" =~ ^[0-9]+$ ]] || {
+            echo 'The preview release ID must be numeric.' >&2
+            exit 1
+          }
 
           cutoff=$(date -u -d '30 days ago' +%s)
           asset_rows=$(gh api --paginate \
             "repos/${GITHUB_REPOSITORY}/releases/$release_id/assets?per_page=100" \
             --jq '.[] | [.id, .name, .created_at] | @tsv')
           while IFS=$'\t' read -r asset_id name created_at; do
-            if [[ ! "$name" =~ ^o-sfu-flamegraph(-(baseline|comparison))?-[0-9]+-[0-9]+\.png$ ]]; then
+            if [[ ! "$name" =~ ^o-sfu-flamegraph(-(baseline|comparison))?-[0-9]+-[0-9]+\.png$ ]] && \
+              [[ ! "$name" =~ ^o-sfu-telemetry-[0-9]+-[0-9]+-(single|baseline|comparison)-[a-z0-9-]+\.png$ ]]; then
               continue
             fi
             created=$(date -u -d "$created_at" +%s)
@@ -769,14 +909,87 @@ jobs:
                 "repos/${GITHUB_REPOSITORY}/releases/assets/$asset_id"
             fi
           done <<< "$asset_rows"
+          echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
 
-          for file in "${pngs[@]}"; do
-            name=${file##*/}
-            url="https://github.com/${GITHUB_REPOSITORY}/releases/download/$release/$name"
-            uploaded=false
+      - name: Publish public telemetry dashboards
+        id: dashboard-publication
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODE: ${{ needs.load.outputs.load_mode }}
+          RELEASE_ID: ${{ steps.preview-release.outputs.release_id }}
+          SUMMARY_ATTEMPT: ${{ needs.load.outputs.summary_attempt }}
+        run: |
+          set -euo pipefail
+          summary=handoff/load-publication.md
+          [[ -s "$summary" ]] || {
+            echo 'The load summary handoff is empty.' >&2
+            exit 1
+          }
+          [[ "$MODE" == single || "$MODE" == comparison ]] || {
+            echo "Unexpected load mode: $MODE" >&2
+            exit 1
+          }
+          [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ && "$SUMMARY_ATTEMPT" =~ ^[0-9]+$ ]] || {
+            echo 'The run ID and attempt must be numeric.' >&2
+            exit 1
+          }
+          [[ "$RELEASE_ID" =~ ^[0-9]+$ ]] || {
+            echo 'The preview release is unavailable.' >&2
+            exit 1
+          }
+
+          scenarios=(
+            audio-mesh-1x8-30s
+            audio-mesh-2x12-60s
+            audio-mesh-3x12-120s
+            audio-mesh-1x28-120s
+            video-gallery-1x12-4p-30s
+            video-gallery-1x64-10p-60s
+          )
+
+          valid_scenario() {
+            local candidate=$1
+            local scenario
+            for scenario in "${scenarios[@]}"; do
+              [[ "$candidate" != "$scenario" ]] || return 0
+            done
+            return 1
+          }
+
+          dashboard_role() {
+            local name=$1
+            local prefix="o-sfu-telemetry-${GITHUB_RUN_ID}-${SUMMARY_ATTEMPT}-"
+            local suffix=${name#"$prefix"}
+            [[ "$suffix" != "$name" && "$suffix" == *.png ]] || return 1
+            suffix=${suffix%.png}
+            local role=${suffix%%-*}
+            local scenario=${suffix#"$role-"}
+            [[ "$scenario" != "$suffix" ]] || return 1
+            if [[ "$MODE" == single ]]; then
+              [[ "$role" == single ]] || return 1
+            else
+              [[ "$role" == baseline || "$role" == comparison ]] || return 1
+            fi
+            valid_scenario "$scenario" || return 1
+            printf '%s\t%s' "$role" "$scenario"
+          }
+
+          count_fixed() {
+            { grep -oF -- "$1" "$2" || true; } | wc -l | tr -d '[:space:]'
+          }
+
+          publish_asset() {
+            local file=$1
+            local name=${file##*/}
+            local release=load-test-assets
+            local url="https://github.com/${GITHUB_REPOSITORY}/releases/download/$release/$name"
+            local uploaded=false
+            local matching_assets
             matching_assets=$(gh api --paginate \
-              "repos/${GITHUB_REPOSITORY}/releases/$release_id/assets?per_page=100" \
+              "repos/${GITHUB_REPOSITORY}/releases/$RELEASE_ID/assets?per_page=100" \
               --jq ".[] | select(.name == \"$name\") | [.id, .state] | @tsv")
+            local asset_id state
             while IFS=$'\t' read -r asset_id state; do
               [[ -n "$asset_id" ]] || continue
               case "$state" in
@@ -789,43 +1002,283 @@ jobs:
                   ;;
                 *)
                   echo "$name has an unexpected release asset state: $state" >&2
-                  exit 1
+                  return 1
                   ;;
               esac
             done <<< "$matching_assets"
             if [[ "$uploaded" == false ]]; then
               gh release upload "$release" "$file" --repo "$GITHUB_REPOSITORY"
             fi
-            downloaded="$RUNNER_TEMP/$name"
+            local downloaded="$RUNNER_TEMP/$name"
             curl --fail --silent --show-error --location \
               --retry 5 --retry-all-errors --retry-delay 2 \
               --output "$downloaded" "$url"
             cmp --silent "$file" "$downloaded" || {
               echo "$name differs from its public release asset." >&2
+              return 1
+            }
+          }
+
+          shopt -s globstar nullglob
+          pngs=(
+            handoff/**/o-sfu-telemetry-"${GITHUB_RUN_ID}"-"${SUMMARY_ATTEMPT}"-*.png
+          )
+          if [[ "$MODE" == single ]]; then
+            expected=6
+          else
+            expected=12
+          fi
+          (( ${#pngs[@]} == expected )) || {
+            echo "Expected $expected telemetry dashboards, found ${#pngs[@]}." >&2
+            exit 1
+          }
+
+          declare -A seen_assets=()
+          declare -A single_dashboards=()
+          declare -A baseline_dashboards=()
+          declare -A comparison_dashboards=()
+          for file in "${pngs[@]}"; do
+            [[ -f "$file" && ! -L "$file" ]] || {
+              echo "Dashboard is not a regular file: $file" >&2
+              exit 1
+            }
+            name=${file##*/}
+            [[ -z "${seen_assets[$name]:-}" ]] || {
+              echo "Duplicate dashboard asset: $name" >&2
+              exit 1
+            }
+            seen_assets["$name"]=1
+            role_and_scenario=$(dashboard_role "$name") || {
+              echo "Unexpected dashboard asset: $name" >&2
+              exit 1
+            }
+            IFS=$'\t' read -r role scenario <<< "$role_and_scenario"
+            case "$role" in
+              single) single_dashboards["$scenario"]=1 ;;
+              baseline) baseline_dashboards["$scenario"]=1 ;;
+              comparison) comparison_dashboards["$scenario"]=1 ;;
+            esac
+            signature=$(od -An -tx1 -N8 "$file" | tr -d '[:space:]')
+            [[ "$signature" == 89504e470d0a1a0a ]] || {
+              echo "$name is not a PNG." >&2
+              exit 1
+            }
+            size=$(stat -c %s "$file")
+            (( size >= 1024 && size <= 10485760 )) || {
+              echo "$name has an unexpected size: $size bytes" >&2
               exit 1
             }
           done
 
-      - name: Publish CPU profile summary
+          for scenario in "${scenarios[@]}"; do
+            if [[ "$MODE" == single ]]; then
+              [[ -n "${single_dashboards[$scenario]:-}" ]] || {
+                echo "$scenario has no single-run dashboard." >&2
+                exit 1
+              }
+            else
+              [[ -n "${baseline_dashboards[$scenario]:-}" ]] || {
+                echo "$scenario has no baseline dashboard." >&2
+                exit 1
+              }
+              [[ -n "${comparison_dashboards[$scenario]:-}" ]] || {
+                echo "$scenario has no comparison dashboard." >&2
+                exit 1
+              }
+            fi
+          done
+
+          image_count=$(count_fixed ' telemetry dashboard](' "$summary")
+          (( image_count == expected )) || {
+            echo "Expected $expected dashboard image references, found $image_count." >&2
+            exit 1
+          }
+          for file in "${pngs[@]}"; do
+            name=${file##*/}
+            IFS=$'\t' read -r role _scenario <<< "$(dashboard_role "$name")"
+            url="https://github.com/${GITHUB_REPOSITORY}/releases/download/load-test-assets/$name"
+            reference="[![${role} telemetry dashboard](${url})]("
+            references=$(count_fixed "$reference" "$summary")
+            (( references == 1 )) || {
+              echo "$name has $references Markdown image references." >&2
+              exit 1
+            }
+          done
+
+          for file in "${pngs[@]}"; do
+            publish_asset "$file"
+          done
+
+      - name: Publish public flamegraph previews
+        id: flamegraph-publication
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODE: ${{ needs.load.outputs.load_mode }}
+          RELEASE_ID: ${{ steps.preview-release.outputs.release_id }}
+          SUMMARY_ATTEMPT: ${{ needs.load.outputs.summary_attempt }}
+        run: |
+          set -euo pipefail
+          profile=handoff/profile-publication.md
+          [[ -s "$profile" ]] || {
+            echo 'The CPU profile summary handoff is empty.' >&2
+            exit 1
+          }
+          [[ "$MODE" == single || "$MODE" == comparison ]] || {
+            echo "Unexpected load mode: $MODE" >&2
+            exit 1
+          }
+          [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ && "$SUMMARY_ATTEMPT" =~ ^[0-9]+$ ]] || {
+            echo 'The run ID and attempt must be numeric.' >&2
+            exit 1
+          }
+
+          count_fixed() {
+            { grep -oF -- "$1" "$2" || true; } | wc -l | tr -d '[:space:]'
+          }
+
+          publish_asset() {
+            local file=$1
+            local name=${file##*/}
+            local release=load-test-assets
+            local url="https://github.com/${GITHUB_REPOSITORY}/releases/download/$release/$name"
+            local uploaded=false
+            local matching_assets
+            matching_assets=$(gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/releases/$RELEASE_ID/assets?per_page=100" \
+              --jq ".[] | select(.name == \"$name\") | [.id, .state] | @tsv")
+            local asset_id state
+            while IFS=$'\t' read -r asset_id state; do
+              [[ -n "$asset_id" ]] || continue
+              case "$state" in
+                starter)
+                  gh api --method DELETE \
+                    "repos/${GITHUB_REPOSITORY}/releases/assets/$asset_id"
+                  ;;
+                uploaded)
+                  uploaded=true
+                  ;;
+                *)
+                  echo "$name has an unexpected release asset state: $state" >&2
+                  return 1
+                  ;;
+              esac
+            done <<< "$matching_assets"
+            if [[ "$uploaded" == false ]]; then
+              gh release upload "$release" "$file" --repo "$GITHUB_REPOSITORY"
+            fi
+            local downloaded="$RUNNER_TEMP/$name"
+            curl --fail --silent --show-error --location \
+              --retry 5 --retry-all-errors --retry-delay 2 \
+              --output "$downloaded" "$url"
+            cmp --silent "$file" "$downloaded" || {
+              echo "$name differs from its public release asset." >&2
+              return 1
+            }
+          }
+
+          shopt -s globstar nullglob
+          pngs=(handoff/**/o-sfu-flamegraph-*.png)
+          flamegraph_references=$(count_fixed '[![o-sfu CPU flamegraph](' "$profile")
+          (( flamegraph_references == ${#pngs[@]} )) || {
+            echo "Found ${#pngs[@]} flamegraphs and $flamegraph_references image references." >&2
+            exit 1
+          }
+          (( ${#pngs[@]} > 0 )) || exit 0
+          [[ "$RELEASE_ID" =~ ^[0-9]+$ ]] || {
+            echo 'The preview release is unavailable.' >&2
+            exit 1
+          }
+
+          single="o-sfu-flamegraph-${GITHUB_RUN_ID}-${SUMMARY_ATTEMPT}.png"
+          baseline="o-sfu-flamegraph-baseline-${GITHUB_RUN_ID}-${SUMMARY_ATTEMPT}.png"
+          comparison="o-sfu-flamegraph-comparison-${GITHUB_RUN_ID}-${SUMMARY_ATTEMPT}.png"
+          declare -A seen_assets=()
+          for file in "${pngs[@]}"; do
+            [[ -f "$file" && ! -L "$file" ]] || {
+              echo "Flamegraph is not a regular file: $file" >&2
+              exit 1
+            }
+            name=${file##*/}
+            [[ -z "${seen_assets[$name]:-}" ]] || {
+              echo "Duplicate flamegraph asset: $name" >&2
+              exit 1
+            }
+            seen_assets["$name"]=1
+            case "$name" in
+              "$single")
+                [[ "$MODE" == single ]] || {
+                  echo "Unexpected single-run flamegraph: $name" >&2
+                  exit 1
+                }
+                ;;
+              "$baseline"|"$comparison")
+                [[ "$MODE" == comparison ]] || {
+                  echo "Unexpected comparison flamegraph: $name" >&2
+                  exit 1
+                }
+                ;;
+              *)
+                echo "Unexpected flamegraph asset: $name" >&2
+                exit 1
+                ;;
+            esac
+            signature=$(od -An -tx1 -N8 "$file" | tr -d '[:space:]')
+            [[ "$signature" == 89504e470d0a1a0a ]] || {
+              echo "$name is not a PNG." >&2
+              exit 1
+            }
+            size=$(stat -c %s "$file")
+            (( size >= 1024 && size <= 10485760 )) || {
+              echo "$name has an unexpected size: $size bytes" >&2
+              exit 1
+            }
+            url="https://github.com/${GITHUB_REPOSITORY}/releases/download/load-test-assets/$name"
+            reference="[![o-sfu CPU flamegraph](${url})]("
+            references=$(count_fixed "$reference" "$profile")
+            (( references == 1 )) || {
+              echo "$name has $references Markdown image references." >&2
+              exit 1
+            }
+          done
+
+          for file in "${pngs[@]}"; do
+            publish_asset "$file"
+          done
+
+      - name: Publish load summaries
         if: always()
         env:
+          DASHBOARD_PUBLICATION: ${{ steps.dashboard-publication.outcome }}
           FLAMEGRAPH_PUBLICATION: ${{ steps.flamegraph-publication.outcome }}
         run: |
           set -euo pipefail
-          summary=handoff/profile-publication.md
-          if [[ ! -s "$summary" ]]; then
-            echo '# o-sfu CPU profile' >> "$GITHUB_STEP_SUMMARY"
+          load_publication=handoff/load-publication.md
+          load_fallback=handoff/load-summary-fallback.md
+          profile=handoff/profile-publication.md
+
+          if [[ "$DASHBOARD_PUBLICATION" == success && -s "$load_publication" ]]; then
+            cat "$load_publication" >> "$GITHUB_STEP_SUMMARY"
+          elif [[ -s "$load_fallback" ]]; then
+            echo '> Preview publication failed. Numeric telemetry remains valid. SVG dashboards and raw samples remain available when the workflow artifact upload succeeded.' >> "$GITHUB_STEP_SUMMARY"
             echo >> "$GITHUB_STEP_SUMMARY"
-            echo 'The profile summary handoff is unavailable.' >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-          if [[ "$FLAMEGRAPH_PUBLICATION" != success ]]; then
-            echo '> Flamegraph preview publication failed. The profile breakdown remains valid. Use the workflow artifact for the interactive SVG.' >> "$GITHUB_STEP_SUMMARY"
+            cat "$load_fallback" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '# o-sfu load report' >> "$GITHUB_STEP_SUMMARY"
             echo >> "$GITHUB_STEP_SUMMARY"
-            sed \
-              -e '/^\[!\[o-sfu CPU flamegraph\]/d' \
-              -e '/^The embedded PNG is a static preview\./d' \
-              "$summary" >> "$GITHUB_STEP_SUMMARY"
-            exit 1
+            echo 'The load summary handoff is unavailable.' >> "$GITHUB_STEP_SUMMARY"
           fi
-          cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ -s "$profile" ]]; then
+            echo >> "$GITHUB_STEP_SUMMARY"
+            if [[ "$FLAMEGRAPH_PUBLICATION" == success ]]; then
+              cat "$profile" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo '> Flamegraph preview publication failed. The profile breakdown remains available below.' >> "$GITHUB_STEP_SUMMARY"
+              echo >> "$GITHUB_STEP_SUMMARY"
+              sed \
+                -e '/^\[!\[o-sfu CPU flamegraph\]/d' \
+                -e '/^The embedded PNG is a static preview\./d' \
+                "$profile" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi

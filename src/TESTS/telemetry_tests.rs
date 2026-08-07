@@ -1,12 +1,13 @@
-use std::{env::temp_dir, net::Ipv4Addr, process};
+use std::{env::temp_dir, io::Cursor, net::Ipv4Addr, process};
 
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
     net::TcpListener,
-    time::timeout,
+    time::{sleep, timeout},
 };
 
 use super::*;
+use crate::phase::{PhaseAcknowledgement, PhaseEvent, exchange_phase};
 
 const METRICS: &str = r#"
 # HELP osfu_rtp_packets_total Total RTP packets processed by flow direction.
@@ -18,6 +19,46 @@ osfu_rtp_payload_bytes_total{direction="ingress"} 1100
 osfu_rtp_forwarded_packets_total{destination="local_rtc"} 22
 osfu_rtp_packets_total{direction="egress"} 22
 "#;
+
+#[test]
+fn phase_event_uses_a_closed_typed_protocol() -> Result<()> {
+    assert_eq!(
+        serde_json::to_string(&PhaseEvent {
+            phase: ScenarioPhase::Measured,
+        })?,
+        r#"{"phase":"measured"}"#
+    );
+    assert!(serde_json::from_str::<PhaseEvent>(r#"{"phase":"unknown"}"#).is_err());
+    assert!(serde_json::from_str::<PhaseEvent>(r#"{"phase":"setup","extra":true}"#).is_err());
+    assert_eq!(
+        serde_json::to_string(&PhaseAcknowledgement {
+            phase: ScenarioPhase::Measured,
+        })?,
+        r#"{"phase":"measured"}"#
+    );
+    Ok(())
+}
+
+#[test]
+fn phase_exchange_requires_the_matching_acknowledgement() -> Result<()> {
+    let mut output = Vec::new();
+    exchange_phase(
+        &mut Cursor::new(b"{\"phase\":\"warmup\"}\n"),
+        &mut output,
+        ScenarioPhase::Warmup,
+    )?;
+
+    assert_eq!(output, b"{\"phase\":\"warmup\"}\n");
+    assert!(
+        exchange_phase(
+            &mut Cursor::new(b"{\"phase\":\"drain\"}\n"),
+            &mut Vec::new(),
+            ScenarioPhase::Measured,
+        )
+        .is_err()
+    );
+    Ok(())
+}
 
 #[test]
 fn process_stat_extracts_cpu_identity_and_rss() -> Result<()> {
@@ -179,6 +220,7 @@ fn process_identity_rejects_pid_reuse() -> Result<()> {
 #[test]
 fn telemetry_record_preserves_unavailable_loop_delay() -> Result<()> {
     let record = TelemetryRecord {
+        schema_version: TELEMETRY_SCHEMA_VERSION,
         elapsed_ms: 1000,
         scrape_duration_ms: 2,
         final_sample: false,
@@ -206,6 +248,12 @@ fn telemetry_record_preserves_unavailable_loop_delay() -> Result<()> {
         },
     };
     let value = serde_json::to_value(record)?;
+    assert_eq!(
+        value
+            .get("schemaVersion")
+            .and_then(serde_json::Value::as_u64),
+        Some(u64::from(TELEMETRY_SCHEMA_VERSION))
+    );
     let workers = value
         .get("workers")
         .and_then(serde_json::Value::as_array)
@@ -238,7 +286,9 @@ async fn sampler_records_immediate_and_final_samples() -> Result<()> {
         return Ok(());
     }
     let (summary, records) = run_sampler_with_mock("success", false).await?;
-    let mut records = records.into_iter();
+    let mut records = records
+        .into_iter()
+        .filter(|record| !matches!(&record.outcome, TelemetryOutcome::Phase { .. }));
     let first = records.next().context("immediate sample is missing")?;
     let final_sample = records.next().context("final sample is missing")?;
 
@@ -257,7 +307,9 @@ async fn sampler_retains_failure_and_reaches_final_sample() -> Result<()> {
         return Ok(());
     }
     let (summary, records) = run_sampler_with_mock("recovery", true).await?;
-    let mut records = records.into_iter();
+    let mut records = records
+        .into_iter()
+        .filter(|record| !matches!(&record.outcome, TelemetryOutcome::Phase { .. }));
     let first = records.next().context("immediate sample is missing")?;
     let final_sample = records.next().context("final sample is missing")?;
 
@@ -272,6 +324,119 @@ async fn sampler_retains_failure_and_reaches_final_sample() -> Result<()> {
     ));
     assert!(final_sample.final_sample);
     assert!(records.next().is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn sampler_records_ordered_scenario_phases() -> Result<()> {
+    if cfg!(not(target_os = "linux")) {
+        return Ok(());
+    }
+    let (summary, records) = run_sampler_with_mock("phases", false).await?;
+    let phases = records
+        .iter()
+        .filter_map(|record| match &record.outcome {
+            TelemetryOutcome::Phase { phase } => Some((record.elapsed_ms, *phase)),
+            TelemetryOutcome::Sample { .. } | TelemetryOutcome::Error { .. } => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(summary.sample_count, 2);
+    assert_eq!(summary.error_count, 0);
+    assert_eq!(
+        phases
+            .iter()
+            .map(|(_elapsed_ms, phase)| *phase)
+            .collect::<Vec<_>>(),
+        [
+            ScenarioPhase::Setup,
+            ScenarioPhase::Warmup,
+            ScenarioPhase::Measured,
+            ScenarioPhase::Drain,
+        ]
+    );
+    assert!(
+        phases
+            .windows(2)
+            .all(|pair| matches!(pair, [left, right] if left.0 <= right.0))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn sampler_rejects_an_incomplete_phase_sequence() -> Result<()> {
+    if cfg!(not(target_os = "linux")) {
+        return Ok(());
+    }
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(serve_telemetry(listener, false));
+    let output_path = temp_dir().join(format!(
+        "o-sfu-load-telemetry-{}-incomplete.jsonl",
+        process::id()
+    ));
+    let pid = process::id();
+    let sampler = TelemetrySampler::start(TelemetryConfig::new(
+        format!("http://{address}"),
+        pid,
+        pid,
+        &output_path,
+    ))
+    .await?;
+    sampler.marker().mark(ScenarioPhase::Setup).await?;
+
+    assert!(sampler.finish().await.is_err());
+    timeout(Duration::from_secs(5), server)
+        .await
+        .context("mock telemetry server timed out")?
+        .context("mock telemetry server task failed")??;
+    fs::remove_file(output_path).await?;
+    Ok(())
+}
+
+#[test]
+fn phase_sequence_rejects_skips_duplicates_and_incomplete_runs() -> Result<()> {
+    let mut phases = PhaseSequence::default();
+
+    assert!(phases.advance(ScenarioPhase::Warmup).is_err());
+    phases.advance(ScenarioPhase::Setup)?;
+    assert!(phases.advance(ScenarioPhase::Setup).is_err());
+    assert!(phases.finish().is_err());
+    phases.advance(ScenarioPhase::Warmup)?;
+    phases.advance(ScenarioPhase::Measured)?;
+    phases.advance(ScenarioPhase::Drain)?;
+    phases.finish()?;
+    assert!(phases.advance(ScenarioPhase::Drain).is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn phase_marker_captures_time_before_sampler_dequeue() -> Result<()> {
+    let (commands, mut received) = mpsc::channel(1);
+    let started_at = Instant::now();
+    let marker = TelemetryMarker {
+        commands,
+        started_at,
+    };
+    let dequeue = async move {
+        sleep(Duration::from_millis(200)).await;
+        let command = received.recv().await.context("phase command is missing")?;
+        let SamplerCommand::Phase {
+            phase,
+            elapsed_ms,
+            complete,
+        } = command
+        else {
+            anyhow::bail!("received a finish command instead of a phase")
+        };
+        assert_eq!(phase, ScenarioPhase::Setup);
+        let _result = complete.send(Ok(()));
+        Ok::<_, anyhow::Error>((elapsed_ms, millis(started_at.elapsed())))
+    };
+    let (mark, elapsed) = tokio::join!(marker.mark(ScenarioPhase::Setup), dequeue);
+    mark?;
+    let (captured_ms, dequeued_ms) = elapsed?;
+    assert!(dequeued_ms.saturating_sub(captured_ms) >= 150);
     Ok(())
 }
 
@@ -295,6 +460,15 @@ async fn run_sampler_with_mock(
         &output_path,
     ))
     .await?;
+    let marker = sampler.marker();
+    for phase in [
+        ScenarioPhase::Setup,
+        ScenarioPhase::Warmup,
+        ScenarioPhase::Measured,
+        ScenarioPhase::Drain,
+    ] {
+        marker.mark(phase).await?;
+    }
     let summary = sampler.finish().await?;
     let server_result = timeout(Duration::from_secs(5), server)
         .await

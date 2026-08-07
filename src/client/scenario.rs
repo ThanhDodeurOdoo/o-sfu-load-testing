@@ -1,6 +1,9 @@
 use std::{
     path::Path,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -13,9 +16,9 @@ use o_sfu::{
 use o_sfu_protocol::wire::{UserId, UserPermissions, VideoLayoutIntent};
 use tokio::{
     fs,
-    sync::Barrier,
-    task::JoinSet,
-    time::{Instant, timeout},
+    sync::{Barrier, Notify},
+    task::{JoinSet, spawn_blocking},
+    time::{Instant, sleep_until, timeout},
 };
 
 use crate::{
@@ -28,6 +31,7 @@ use crate::{
         },
         protocol::{LoadPeer, ProtocolPeer},
     },
+    phase::{PhaseReporter, ScenarioPhase},
     video_packets_per_layer,
 };
 
@@ -43,6 +47,58 @@ const WARMUP_VIDEO_FRAMES: u32 = 2;
 struct ScenarioSync {
     barrier: Arc<Barrier>,
     measured_at: Arc<OnceLock<Instant>>,
+    measured_acknowledged: Arc<AtomicBool>,
+    measured_ready: Arc<Notify>,
+    measured_released: Arc<Notify>,
+    phases: PhaseReporter,
+}
+
+impl ScenarioSync {
+    fn new(peer_total: u64, phases: PhaseReporter) -> Result<Self> {
+        Ok(Self {
+            barrier: Arc::new(Barrier::new(
+                usize::try_from(peer_total).context("scenario peer count exceeds usize")?,
+            )),
+            measured_at: Arc::new(OnceLock::new()),
+            measured_acknowledged: Arc::new(AtomicBool::new(false)),
+            measured_ready: Arc::new(Notify::new()),
+            measured_released: Arc::new(Notify::new()),
+            phases,
+        })
+    }
+
+    async fn report_phase(&self, phase: ScenarioPhase) -> Result<()> {
+        let phases = self.phases.clone();
+        spawn_blocking(move || phases.report(phase))
+            .await
+            .context("RTC phase reporter task failed")?
+    }
+
+    async fn report_measured(&self) -> Result<()> {
+        self.measured_ready.notified().await;
+        let started_at = *self
+            .measured_at
+            .get()
+            .context("measured phase has no start time")?;
+        sleep_until(started_at).await;
+        self.report_phase(ScenarioPhase::Measured).await?;
+        self.measured_acknowledged.store(true, Ordering::Release);
+        self.measured_released.notify_waiters();
+        Ok(())
+    }
+
+    async fn wait_for_measured_acknowledgement(&self) {
+        loop {
+            if self.measured_acknowledged.load(Ordering::Acquire) {
+                return;
+            }
+            let released = self.measured_released.notified();
+            if self.measured_acknowledged.load(Ordering::Acquire) {
+                return;
+            }
+            released.await;
+        }
+    }
 }
 
 /// Runs one exact fixed-work scenario through public production boundaries.
@@ -56,17 +112,13 @@ pub async fn run(
     websocket_url: &str,
     output_path: &Path,
     spec: ScenarioSpec,
+    phases: PhaseReporter,
 ) -> Result<ScenarioResult> {
     spec.validate()?;
     let peer_total = u64::from(spec.room_count())
         .checked_mul(u64::from(spec.peers_per_room()))
         .context("scenario peer count overflowed")?;
-    let sync = ScenarioSync {
-        barrier: Arc::new(Barrier::new(
-            usize::try_from(peer_total).context("scenario peer count exceeds usize")?,
-        )),
-        measured_at: Arc::new(OnceLock::new()),
-    };
+    let sync = ScenarioSync::new(peer_total, phases)?;
     let mut room_tasks = JoinSet::new();
     for room_index in 0..spec.room_count() {
         let base_url = base_url.to_owned();
@@ -143,10 +195,14 @@ pub async fn run(
         });
     }
 
-    let mut observation = RunObservation::default();
-    while let Some(result) = room_tasks.join_next().await {
-        observation.merge(result.context("load room task failed")??);
-    }
+    let collect_rooms = async {
+        let mut observation = RunObservation::default();
+        while let Some(result) = room_tasks.join_next().await {
+            observation.merge(result.context("load room task failed")??);
+        }
+        Ok::<_, anyhow::Error>(observation)
+    };
+    let (observation, ()) = tokio::try_join!(collect_rooms, sync.report_measured())?;
     let result = ScenarioResult::completed(spec, observation)?;
     write_result(output_path, &result).await?;
     result.validate(spec)?;
@@ -378,18 +434,7 @@ async fn run_media_peer(
     mut ledger: PacketLedger,
     sync: ScenarioSync,
 ) -> Result<RunObservation> {
-    sync.barrier.wait().await;
-    send_warmup(&mut peer, &mut media, &mut ledger).await?;
-    drain_for(&mut peer, &mut ledger, ROUTE_SETTLE_TIME).await?;
-    sync.barrier.wait().await;
-    media.reset_timelines();
-    peer.reset_send_pacing();
-    sync.barrier.wait().await;
-    let started_at = *sync
-        .measured_at
-        .get_or_init(|| Instant::now() + MEASURE_START_LEAD);
-    peer.set_send_origin(started_at.into_std());
-    sync.barrier.wait().await;
+    let started_at = prepare_media_peer(&mut peer, &mut media, &mut ledger, &sync).await?;
     let target_duration = media.target_duration();
     let deadline = started_at + target_duration + PACKET_TIMEOUT;
     let mut observation = RunObservation::default();
@@ -420,6 +465,9 @@ async fn run_media_peer(
     }
     receive_until_complete(&mut peer, &mut ledger, deadline).await?;
     let completed_at = Instant::now();
+    if sync.barrier.wait().await.is_leader() {
+        sync.report_phase(ScenarioPhase::Drain).await?;
+    }
     sync.barrier.wait().await;
     drain_for(&mut peer, &mut ledger, QUIESCENCE_TIMEOUT).await?;
     observation.elapsed_ms =
@@ -429,6 +477,33 @@ async fn run_media_peer(
     observation.correctness = ledger.finish();
     peer.close().await?;
     Ok(observation)
+}
+
+async fn prepare_media_peer(
+    peer: &mut LoadPeer,
+    media: &mut PeerMedia,
+    ledger: &mut PacketLedger,
+    sync: &ScenarioSync,
+) -> Result<Instant> {
+    if sync.barrier.wait().await.is_leader() {
+        sync.report_phase(ScenarioPhase::Warmup).await?;
+    }
+    sync.barrier.wait().await;
+    send_warmup(peer, media, ledger).await?;
+    drain_for(peer, ledger, ROUTE_SETTLE_TIME).await?;
+    sync.barrier.wait().await;
+    media.reset_timelines();
+    peer.reset_send_pacing();
+    sync.barrier.wait().await;
+    let started_at = *sync
+        .measured_at
+        .get_or_init(|| Instant::now() + MEASURE_START_LEAD);
+    peer.set_send_origin(started_at.into_std());
+    if sync.barrier.wait().await.is_leader() {
+        sync.measured_ready.notify_one();
+    }
+    sync.wait_for_measured_acknowledgement().await;
+    Ok(started_at)
 }
 
 async fn send_warmup(

@@ -2,11 +2,18 @@ use serde_json::json;
 
 use super::{
     ChartSeries, GITHUB_SUMMARY_LIMIT_BYTES, LoadFailure, RunData, SampleSet, TelemetrySummary,
-    chart_axis_max, cpu_micros_per_million, cpu_series, delivery_rate, ensure_summary_size,
-    escape_table, format_mebibytes, moving_average, parse_samples, render_category_charts,
-    render_report, validate_artifact_url, validate_flamegraph_url,
+    chart_axis_max, cpu_micros_per_million, delivery_rate, ensure_summary_size, escape_table,
+    format_mebibytes, parse_samples, render_category_charts, render_report, validate_artifact_url,
+    validate_flamegraph_url,
 };
-use crate::{ScenarioResult, ScenarioSpec};
+use crate::{
+    ScenarioResult, ScenarioSpec,
+    phase::ScenarioPhase,
+    telemetry::{
+        ProcessSample, RtpCounters, TELEMETRY_SCHEMA_VERSION, TelemetryOutcome, TelemetryRecord,
+        TrafficSample, WorkerPressureSample,
+    },
+};
 
 #[test]
 fn report_sorts_workloads_and_renders_visual_rates() -> anyhow::Result<()> {
@@ -163,11 +170,11 @@ fn deserialized_scenario_bounds_are_revalidated() -> anyhow::Result<()> {
 fn telemetry_surfaces_failures_and_high_load_metrics() -> anyhow::Result<()> {
     let samples = parse_samples(
         r#"
-{"elapsedMs":0,"status":"sample","clockTicksPerSecond":100,"server":{"cpuTicks":10,"rssBytes":1048576,"startTimeTicks":5},"rtc":{"cpuTicks":20,"rssBytes":2097152,"startTimeTicks":7},"traffic":{"forwardedLocalRtc":{"packets":0},"egress":{"payloadBytes":0}},"workers":[{"packetLoopDelayMs":2}]}
+{"elapsedMs":0,"finalSample":false,"clockTicksPerSecond":100,"server":{"cpuTicks":10,"rssBytes":1048576,"startTimeTicks":5},"rtc":{"cpuTicks":20,"rssBytes":2097152,"startTimeTicks":7},"traffic":{"forwardedLocalRtc":{"packets":0},"egress":{"payloadBytes":0}},"workers":[{"mediaWorkerId":0,"egressBitrateBps":0,"packetLoopDelayMs":2,"commandBacklogDepth":0,"relayMailboxDepth":0,"workerPressureScore":0}]}
 not-json
 {"elapsedMs":1500,"status":"error","message":"scrape failed"}
-{"elapsedMs":1000,"status":"sample","clockTicksPerSecond":100,"serverCpuPercentMilli":50000,"server":{"cpuTicks":25,"rssBytes":2097152,"startTimeTicks":5},"rtc":{"cpuTicks":30,"rssBytes":3145728,"startTimeTicks":7},"traffic":{"forwardedLocalRtc":{"packets":40},"egress":{"payloadBytes":12000}},"workers":[{"packetLoopDelayMs":7}]}
-{"elapsedMs":2000,"status":"sample","clockTicksPerSecond":100,"serverCpuPercentMilli":100000,"server":{"cpuTicks":40,"rssBytes":3145728,"startTimeTicks":5},"rtc":{"cpuTicks":40,"rssBytes":4194304,"startTimeTicks":7},"traffic":{"forwardedLocalRtc":{"packets":100},"egress":{"payloadBytes":40000}},"workers":[{"packetLoopDelayMs":4}]}
+{"elapsedMs":1000,"finalSample":false,"clockTicksPerSecond":100,"serverCpuPercentMilli":50000,"server":{"cpuTicks":25,"rssBytes":2097152,"startTimeTicks":5},"rtc":{"cpuTicks":30,"rssBytes":3145728,"startTimeTicks":7},"traffic":{"forwardedLocalRtc":{"packets":40},"egress":{"payloadBytes":12000}},"workers":[{"mediaWorkerId":0,"egressBitrateBps":0,"packetLoopDelayMs":7,"commandBacklogDepth":0,"relayMailboxDepth":0,"workerPressureScore":0}]}
+{"elapsedMs":2000,"finalSample":true,"clockTicksPerSecond":100,"serverCpuPercentMilli":100000,"server":{"cpuTicks":40,"rssBytes":3145728,"startTimeTicks":5},"rtc":{"cpuTicks":40,"rssBytes":4194304,"startTimeTicks":7},"traffic":{"forwardedLocalRtc":{"packets":100},"egress":{"payloadBytes":40000}},"workers":[{"mediaWorkerId":0,"egressBitrateBps":0,"packetLoopDelayMs":4,"commandBacklogDepth":0,"relayMailboxDepth":0,"workerPressureScore":0}]}
 "#,
     );
     let report = render_runs(
@@ -179,11 +186,6 @@ not-json
     assert!(report.contains(
         "The SFU CPU average and peak chart is omitted because fewer than two scenarios have chartable values. The tabular metrics remain available."
     ));
-    assert!(report.contains("title \"SFU CPU timeline: smoke-1r-50p\""));
-    assert!(report.contains("x-axis \"elapsed (s)\" 0 --> 1"));
-    assert!(report.contains("line [75, 75]"));
-    assert!(report.contains("CPU values by elapsed-time bucket (%): 0=50, 1=100"));
-    assert!(report.contains("Smoothed CPU values by sample bucket (%): 0=75, 1=75"));
     assert!(report.contains("| smoke-1r-50p | 75.000% | 100.000% |"));
     assert!(report.contains("166 deliveries/CPU-s"));
     assert!(report.contains("50 packets/s"));
@@ -197,22 +199,45 @@ not-json
 }
 
 #[test]
-fn cpu_timeline_smooths_milli_percent_before_rounding() -> anyhow::Result<()> {
+fn telemetry_phase_records_are_ordered_metadata() {
     let samples = parse_samples(
         r#"
-{"elapsedMs":0,"serverCpuPercentMilli":1499}
-{"elapsedMs":1000,"serverCpuPercentMilli":1499}
-{"elapsedMs":2000,"serverCpuPercentMilli":2501}
+{"elapsedMs":0,"status":"phase","phase":"setup"}
+{"elapsedMs":10,"status":"phase","phase":"warmup"}
+{"elapsedMs":20,"status":"phase","phase":"measured"}
+{"elapsedMs":30,"status":"phase","phase":"drain"}
+{"elapsedMs":40,"serverCpuPercentMilli":1000}
 "#,
     );
-    let report = render_runs(
-        vec![run(ScenarioSpec::smoke(1, 50)?, None, 0)?.with_samples(samples)],
-        None,
-    )?;
 
-    assert!(report.contains("line [2, 2, 2]"));
-    assert!(report.contains("CPU values by elapsed-time bucket (%): 0=1, 1=1, 2=3"));
-    Ok(())
+    assert_eq!(samples.samples.len(), 1);
+    assert_eq!(samples.phases.len(), 4);
+    assert_eq!(samples.unavailable, 0);
+}
+
+#[test]
+fn telemetry_rejects_incomplete_and_non_monotonic_phases() {
+    let samples = parse_samples(
+        r#"
+{"elapsedMs":10,"status":"phase","phase":"setup"}
+{"elapsedMs":5,"status":"phase","phase":"warmup"}
+"#,
+    );
+
+    assert_eq!(samples.phases.len(), 1);
+    assert_eq!(samples.unavailable, 2);
+    assert!(
+        samples
+            .errors
+            .iter()
+            .any(|error| error == "telemetry phase elapsed time moved backwards")
+    );
+    assert!(
+        samples
+            .errors
+            .iter()
+            .any(|error| error == "telemetry phase sequence is incomplete")
+    );
 }
 
 #[test]
@@ -238,8 +263,8 @@ fn telemetry_does_not_infer_cpu_percent_from_ticks() -> anyhow::Result<()> {
 fn cpu_chart_keeps_explicit_samples_and_omits_singleton_line() -> anyhow::Result<()> {
     let explicit = parse_samples(
         r#"
-{"elapsedMs":0,"server":{"rssBytes":1}}
-{"elapsedMs":1000,"serverCpuPercentMilli":10000}
+{"elapsedMs":0,"finalSample":false,"server":{"cpuTicks":10,"rssBytes":1}}
+{"elapsedMs":1000,"finalSample":true,"serverCpuPercentMilli":10000,"server":{"cpuTicks":20,"rssBytes":1}}
 "#,
     );
     let ticks_only = parse_samples(
@@ -278,10 +303,6 @@ fn cpu_chart_discloses_single_sample_omission() -> anyhow::Result<()> {
     assert!(report.contains(
         "CPU chart requires an interval-weighted average and sampled peak. Omitted scenarios: S 1r/50p."
     ));
-    assert!(report.contains(
-        "The SFU CPU timeline: smoke-1r-50p chart is omitted because fewer than two telemetry buckets are available. The sampled value remains in the telemetry table."
-    ));
-    assert!(!report.contains("title \"SFU CPU timeline: smoke-1r-50p\""));
     Ok(())
 }
 
@@ -303,15 +324,116 @@ fn scheduled_sender_rate_excludes_receiver_drain_time() -> anyhow::Result<()> {
 fn telemetry_cpu_average_is_weighted_by_sample_interval() {
     let samples = parse_samples(
         r#"
-{"elapsedMs":0,"server":{"rssBytes":1}}
-{"elapsedMs":1000,"serverCpuPercentMilli":10000,"rtcCpuPercentMilli":5000}
-{"elapsedMs":4000,"serverCpuPercentMilli":20000,"rtcCpuPercentMilli":9000}
+{"elapsedMs":0,"finalSample":false,"server":{"cpuTicks":0,"rssBytes":1},"rtc":{"cpuTicks":0,"rssBytes":1}}
+{"elapsedMs":1000,"finalSample":false,"serverCpuPercentMilli":10000,"rtcCpuPercentMilli":5000}
+{"elapsedMs":4000,"finalSample":true,"serverCpuPercentMilli":20000,"rtcCpuPercentMilli":9000,"server":{"cpuTicks":1,"rssBytes":1},"rtc":{"cpuTicks":1,"rssBytes":1}}
 "#,
     );
     let summary = TelemetrySummary::from_samples(Some(&samples), 0);
 
     assert_eq!(summary.server_cpu_percent_milli, Some(17_500));
     assert_eq!(summary.rtc_cpu_percent_milli, Some(8_000));
+}
+
+#[test]
+fn failed_initial_scrape_omits_whole_window_metrics() -> anyhow::Result<()> {
+    let samples = parse_samples(&telemetry_payload(&[
+        telemetry_error(0, false),
+        telemetry_phase(ScenarioPhase::Setup, 0),
+        telemetry_phase(ScenarioPhase::Warmup, 500),
+        telemetry_sample(1_000, false, 25, Some(50_000)),
+        telemetry_phase(ScenarioPhase::Measured, 1_500),
+        telemetry_phase(ScenarioPhase::Drain, 1_800),
+        telemetry_sample(2_000, true, 40, Some(100_000)),
+    ])?);
+
+    let summary = TelemetrySummary::from_samples(Some(&samples), 50);
+
+    assert_eq!(summary.server_cpu_percent_milli, None);
+    assert_eq!(summary.rtc_cpu_percent_milli, None);
+    assert_eq!(summary.deliveries_per_server_cpu_second, None);
+    assert_eq!(summary.server_cpu_micros_per_million_deliveries, None);
+    assert_eq!(summary.forwarded_packets_per_second, None);
+    assert_eq!(summary.egress_payload_bits_per_second, None);
+    assert_eq!(summary.server_cpu_peak_percent_milli, Some(100_000));
+    assert_eq!(summary.server_rss_bytes, Some(40 * 1_024));
+    assert_eq!(summary.rtc_rss_bytes, Some(40 * 2_048));
+    assert_eq!(summary.packet_loop_delay_ms, Some(40));
+    Ok(())
+}
+
+#[test]
+fn failed_final_scrape_omits_whole_window_metrics() -> anyhow::Result<()> {
+    let samples = parse_samples(&telemetry_payload(&[
+        telemetry_sample(0, false, 10, None),
+        telemetry_phase(ScenarioPhase::Setup, 0),
+        telemetry_phase(ScenarioPhase::Warmup, 500),
+        telemetry_sample(1_000, false, 25, Some(50_000)),
+        telemetry_phase(ScenarioPhase::Measured, 1_500),
+        telemetry_phase(ScenarioPhase::Drain, 1_800),
+        telemetry_error(2_000, true),
+    ])?);
+
+    let summary = TelemetrySummary::from_samples(Some(&samples), 50);
+
+    assert_eq!(summary.server_cpu_percent_milli, None);
+    assert_eq!(summary.rtc_cpu_percent_milli, None);
+    assert_eq!(summary.deliveries_per_server_cpu_second, None);
+    assert_eq!(summary.server_cpu_micros_per_million_deliveries, None);
+    assert_eq!(summary.forwarded_packets_per_second, None);
+    assert_eq!(summary.egress_payload_bits_per_second, None);
+    assert_eq!(summary.server_cpu_peak_percent_milli, Some(50_000));
+    assert_eq!(summary.server_rss_bytes, Some(25 * 1_024));
+    assert_eq!(summary.rtc_rss_bytes, Some(25 * 2_048));
+    assert_eq!(summary.packet_loop_delay_ms, Some(25));
+    Ok(())
+}
+
+#[test]
+fn legacy_samples_without_final_marker_keep_point_diagnostics_only() {
+    let samples = parse_samples(
+        r#"
+{"elapsedMs":0,"server":{"cpuTicks":10,"rssBytes":10240,"startTimeTicks":5},"rtc":{"cpuTicks":10,"rssBytes":20480},"clockTicksPerSecond":100,"traffic":{"forwardedLocalRtc":{"packets":40},"egress":{"payloadBytes":16000}},"workers":[{"mediaWorkerId":0,"egressBitrateBps":10000,"packetLoopDelayMs":10,"commandBacklogDepth":0,"relayMailboxDepth":0,"workerPressureScore":0}]}
+{"elapsedMs":1000,"serverCpuPercentMilli":50000,"rtcCpuPercentMilli":25000,"server":{"cpuTicks":25,"rssBytes":25600,"startTimeTicks":5},"rtc":{"cpuTicks":25,"rssBytes":51200},"clockTicksPerSecond":100,"traffic":{"forwardedLocalRtc":{"packets":100},"egress":{"payloadBytes":40000}},"workers":[{"mediaWorkerId":0,"egressBitrateBps":25000,"packetLoopDelayMs":25,"commandBacklogDepth":0,"relayMailboxDepth":0,"workerPressureScore":0}]}
+"#,
+    );
+
+    let summary = TelemetrySummary::from_samples(Some(&samples), 50);
+
+    assert_eq!(summary.server_cpu_percent_milli, None);
+    assert_eq!(summary.rtc_cpu_percent_milli, None);
+    assert_eq!(summary.deliveries_per_server_cpu_second, None);
+    assert_eq!(summary.server_cpu_micros_per_million_deliveries, None);
+    assert_eq!(summary.forwarded_packets_per_second, None);
+    assert_eq!(summary.egress_payload_bits_per_second, None);
+    assert_eq!(summary.server_cpu_peak_percent_milli, Some(50_000));
+    assert_eq!(summary.server_rss_bytes, Some(25_600));
+    assert_eq!(summary.rtc_rss_bytes, Some(51_200));
+    assert_eq!(summary.packet_loop_delay_ms, Some(25));
+}
+
+#[test]
+fn current_schema_requires_phases_while_schema_zero_does_not() -> anyhow::Result<()> {
+    let current = parse_samples(&telemetry_payload(&[
+        telemetry_sample(0, false, 10, None),
+        telemetry_sample(1_000, true, 25, Some(50_000)),
+    ])?);
+    let mut legacy_initial = telemetry_sample(0, false, 10, None);
+    legacy_initial.schema_version = 0;
+    let mut legacy_final = telemetry_sample(1_000, true, 25, Some(50_000));
+    legacy_final.schema_version = 0;
+    let legacy = parse_samples(&telemetry_payload(&[legacy_initial, legacy_final])?);
+
+    assert_eq!(current.unavailable, 1);
+    assert!(
+        current
+            .errors
+            .iter()
+            .any(|error| error == "telemetry phase sequence is incomplete")
+    );
+    assert_eq!(legacy.unavailable, 0);
+    assert!(legacy.phases.is_empty());
+    Ok(())
 }
 
 #[test]
@@ -425,34 +547,6 @@ fn category_charts_avoid_singleton_facets_and_scale_each_panel() -> anyhow::Resu
 }
 
 #[test]
-fn moving_average_smooths_without_changing_length_or_range() {
-    assert!(moving_average(&[], 2).is_empty());
-    assert_eq!(moving_average(&[10], 2), [10]);
-    assert_eq!(moving_average(&[0, 0, 100, 0, 0], 1), [0, 33, 33, 33, 0]);
-    assert_eq!(
-        moving_average(&[10, 20, 30, 40, 50], 2),
-        [20, 25, 30, 35, 40]
-    );
-}
-
-#[test]
-fn cpu_timeline_reduces_bucket_count_across_scrape_gaps() {
-    let samples = parse_samples(
-        r#"
-{"elapsedMs":0,"serverCpuPercentMilli":0}
-{"elapsedMs":1000,"serverCpuPercentMilli":100000}
-{"elapsedMs":9000,"serverCpuPercentMilli":0}
-{"elapsedMs":10000,"serverCpuPercentMilli":100000}
-"#,
-    );
-
-    let timeline = cpu_series(&samples.samples);
-
-    assert_eq!(timeline.elapsed_ms, 10_000);
-    assert_eq!(timeline.values, [50_000, 50_000]);
-}
-
-#[test]
 fn table_values_disable_active_markdown() {
     assert_eq!(
         escape_table("a\\|b\n[link](url)! *_`~<c>"),
@@ -510,6 +604,90 @@ fn flamegraph_link_accepts_only_one_load_test_release_asset() {
         ))
         .is_err()
     );
+}
+
+fn telemetry_sample(
+    elapsed_ms: u64,
+    final_sample: bool,
+    cpu_ticks: u64,
+    cpu_percent_milli: Option<u64>,
+) -> TelemetryRecord {
+    TelemetryRecord {
+        schema_version: TELEMETRY_SCHEMA_VERSION,
+        elapsed_ms,
+        scrape_duration_ms: 2,
+        final_sample,
+        outcome: TelemetryOutcome::Sample {
+            clock_ticks_per_second: 100,
+            server_cpu_percent_milli: cpu_percent_milli,
+            rtc_cpu_percent_milli: cpu_percent_milli.map(|value| value / 2),
+            server_rss_bytes: cpu_ticks * 1_024,
+            rtc_rss_bytes: Some(cpu_ticks * 2_048),
+            server: ProcessSample {
+                cpu_ticks,
+                rss_bytes: cpu_ticks * 1_024,
+                start_time_ticks: 5,
+            },
+            rtc: Some(ProcessSample {
+                cpu_ticks,
+                rss_bytes: cpu_ticks * 2_048,
+                start_time_ticks: 7,
+            }),
+            traffic: TrafficSample {
+                ingress: RtpCounters {
+                    packets: cpu_ticks * 2,
+                    payload_bytes: cpu_ticks * 400,
+                },
+                egress: RtpCounters {
+                    packets: cpu_ticks * 4,
+                    payload_bytes: cpu_ticks * 1_600,
+                },
+                forwarded_local_rtc: RtpCounters {
+                    packets: cpu_ticks * 4,
+                    payload_bytes: cpu_ticks * 1_600,
+                },
+            },
+            workers: vec![WorkerPressureSample {
+                media_worker_id: 0,
+                egress_bitrate_bps: cpu_ticks * 1_000,
+                packet_loop_delay_ms: Some(cpu_ticks),
+                command_backlog_depth: 0,
+                relay_mailbox_depth: 0,
+                worker_pressure_score: 0,
+            }],
+        },
+    }
+}
+
+fn telemetry_error(elapsed_ms: u64, final_sample: bool) -> TelemetryRecord {
+    TelemetryRecord {
+        schema_version: TELEMETRY_SCHEMA_VERSION,
+        elapsed_ms,
+        scrape_duration_ms: 750,
+        final_sample,
+        outcome: TelemetryOutcome::Error {
+            message: "scrape failed".to_owned(),
+        },
+    }
+}
+
+fn telemetry_phase(phase: ScenarioPhase, elapsed_ms: u64) -> TelemetryRecord {
+    TelemetryRecord {
+        schema_version: TELEMETRY_SCHEMA_VERSION,
+        elapsed_ms,
+        scrape_duration_ms: 0,
+        final_sample: false,
+        outcome: TelemetryOutcome::Phase { phase },
+    }
+}
+
+fn telemetry_payload(records: &[TelemetryRecord]) -> anyhow::Result<String> {
+    records
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<serde_json::Result<Vec<_>>>()
+        .map(|records| records.join("\n"))
+        .map_err(Into::into)
 }
 
 fn run(

@@ -1,6 +1,7 @@
 pub mod client;
 pub mod comparison;
 pub mod controller;
+pub mod phase;
 pub mod profile;
 pub mod report;
 pub mod telemetry;

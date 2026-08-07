@@ -1,6 +1,7 @@
 use std::{
+    convert::identity,
     fs::File,
-    io::ErrorKind,
+    io::{ErrorKind, Write as _},
     net::{Ipv4Addr, TcpListener},
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
@@ -15,14 +16,17 @@ use tokio::signal::ctrl_c;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::{
     fs,
-    process::{Child, Command},
+    io::{AsyncBufRead, AsyncBufReadExt as _, AsyncWriteExt as _, BufReader},
+    process::{Child, ChildStdin, ChildStdout, Command},
+    sync::oneshot,
     time::{sleep, timeout},
 };
 
 use crate::{
     AUTH_KEY, ScenarioResult, ScenarioSpec,
+    phase::{PhaseAcknowledgement, PhaseEvent, PhaseSequence, ScenarioPhase},
     profile::ServerProfiler,
-    telemetry::{TelemetryConfig, TelemetrySampler},
+    telemetry::{TelemetryConfig, TelemetryMarker, TelemetrySampler},
 };
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
@@ -32,6 +36,7 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SETUP_ROUND_TIMEOUT: Duration = Duration::from_secs(20);
 const RTC_WORKER_OVERHEAD: Duration = Duration::from_secs(40);
+const MAX_PHASE_FRAME_BYTES: usize = 256;
 
 pub struct RunConfig {
     pub server_binary: PathBuf,
@@ -285,7 +290,7 @@ async fn run_rtc_worker(
     server: &mut Child,
     shutdown_signals: &mut ShutdownSignals,
 ) -> Result<RtcWorkerCompletion> {
-    let stdout = File::create(config.output_directory.join("rtc.stdout.log"))
+    let stdout_log = File::create(config.output_directory.join("rtc.stdout.log"))
         .context("failed to create the RTC stdout log")?;
     let stderr = File::create(config.output_directory.join("rtc.stderr.log"))
         .context("failed to create the RTC stderr log")?;
@@ -300,10 +305,15 @@ async fn run_rtc_worker(
         .arg("--spec")
         .arg(artifacts.spec)
         .kill_on_drop(true)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
         .stderr(Stdio::from(stderr));
     let mut rtc = command.spawn().context("failed to start the RTC worker")?;
+    let phase_input = rtc.stdin.take().context("RTC worker has no phase input")?;
+    let phase_output = rtc
+        .stdout
+        .take()
+        .context("RTC worker has no phase output")?;
     let server_pid = server.id().context("o-sfu process has no process id")?;
     let rtc_pid = rtc.id().context("RTC worker has no process id")?;
     let telemetry = TelemetrySampler::start(TelemetryConfig::new(
@@ -314,47 +324,186 @@ async fn run_rtc_worker(
     ))
     .await
     .context("failed to start telemetry sampling")?;
-    let deadline = rtc_worker_deadline(config.spec);
-    let completion = async {
-        tokio::select! {
-            status = rtc.wait() => {
-                let status = status.context("failed to wait for the RTC worker")?;
-                ensure!(status.success(), "RTC worker exited with {status}");
-                Ok(RtcWorkerCompletion::Completed)
-            }
-            status = server.wait() => {
-                let status = status.context("failed to wait for o-sfu during RTC work")?;
-                stop_rtc_worker(&mut rtc).await?;
-                Ok(RtcWorkerCompletion::ServerExited(status))
-            }
-            () = sleep(deadline) => {
-                stop_rtc_worker(&mut rtc).await?;
-                Err(anyhow!(
-                    "RTC worker exceeded its {} second deadline",
-                    deadline.as_secs()
-                ))
-            }
-            signal_result = shutdown_signals.recv() => {
-                let signal_error = signal_result.map_or_else(
-                    |error| error,
-                    |()| anyhow!("load run interrupted during RTC work"),
-                );
-                stop_rtc_worker(&mut rtc)
-                    .await
-                    .context("failed to stop the RTC worker after a shutdown signal")?;
-                Err(signal_error)
-            }
+    let (phase_error_sender, mut phase_error) = oneshot::channel();
+    let telemetry_marker = telemetry.marker();
+    let mut phase_task = tokio::spawn(async move {
+        let result =
+            capture_rtc_phases(phase_output, phase_input, stdout_log, telemetry_marker).await;
+        if result.is_err() {
+            let _result = phase_error_sender.send(());
         }
-    }
+        result
+    });
+    let deadline = rtc_worker_deadline(config.spec);
+    let completion = wait_for_rtc_worker(
+        &mut rtc,
+        server,
+        shutdown_signals,
+        &mut phase_error,
+        deadline,
+    )
     .await;
+    let phase_result = match timeout(SHUTDOWN_TIMEOUT, &mut phase_task).await {
+        Ok(result) => result
+            .context("RTC phase stream task failed")
+            .and_then(identity),
+        Err(_elapsed) => {
+            phase_task.abort();
+            let _result = phase_task.await;
+            Err(anyhow!("RTC phase stream exceeded its shutdown deadline"))
+        }
+    };
+    let completion = combine_rtc_and_phases(completion, phase_result);
     let telemetry_result = telemetry.finish().await;
     match (completion, telemetry_result) {
-        (Ok(completion), Ok(_summary)) => Ok(completion),
+        (Ok(completion @ RtcWorkerCompletion::ServerExited(_)), _) | (Ok(completion), Ok(_)) => {
+            Ok(completion)
+        }
         (Err(error), Ok(_)) | (Ok(_), Err(error)) => Err(error),
         (Err(run_error), Err(telemetry_error)) => Err(anyhow!(
             "RTC work failed: {run_error:#}. telemetry shutdown also failed: {telemetry_error:#}"
         )),
     }
+}
+
+async fn wait_for_rtc_worker(
+    rtc: &mut Child,
+    server: &mut Child,
+    shutdown_signals: &mut ShutdownSignals,
+    phase_error: &mut oneshot::Receiver<()>,
+    deadline: Duration,
+) -> Result<RtcWaitOutcome> {
+    tokio::select! {
+        status = rtc.wait() => {
+            let status = status.context("failed to wait for the RTC worker")?;
+            ensure!(status.success(), "RTC worker exited with {status}");
+            Ok(RtcWaitOutcome::Completed)
+        }
+        status = server.wait() => {
+            let status = status.context("failed to wait for o-sfu during RTC work")?;
+            stop_rtc_worker(rtc).await?;
+            Ok(RtcWaitOutcome::ServerExited(status))
+        }
+        () = sleep(deadline) => {
+            stop_rtc_worker(rtc).await?;
+            Err(anyhow!(
+                "RTC worker exceeded its {} second deadline",
+                deadline.as_secs()
+            ))
+        }
+        signal_result = shutdown_signals.recv() => {
+            let signal_error = signal_result.map_or_else(
+                |error| error,
+                |()| anyhow!("load run interrupted during RTC work"),
+            );
+            stop_rtc_worker(rtc)
+                .await
+                .context("failed to stop the RTC worker after a shutdown signal")?;
+            Err(signal_error)
+        }
+        Ok(()) = phase_error => {
+            stop_rtc_worker(rtc)
+                .await
+                .context("failed to stop the RTC worker after a phase stream failure")?;
+            Ok(RtcWaitOutcome::PhaseFailed)
+        }
+    }
+}
+
+async fn capture_rtc_phases(
+    output: ChildStdout,
+    mut input: ChildStdin,
+    mut log: File,
+    telemetry: TelemetryMarker,
+) -> Result<()> {
+    let mut output = BufReader::new(output);
+    let mut phases = PhaseSequence::default();
+    let mut setup_started = false;
+    while let Some(frame) = read_phase_frame(&mut output).await? {
+        log.write_all(&frame)
+            .context("failed to write the RTC stdout log")?;
+        log.flush().context("failed to flush the RTC stdout log")?;
+        let line = str::from_utf8(&frame)
+            .context("RTC phase stream is not UTF-8")?
+            .trim_end_matches(['\r', '\n']);
+        let event = serde_json::from_str::<PhaseEvent>(line)
+            .context("failed to decode an RTC phase event")?;
+        phases.advance(event.phase)?;
+        telemetry.mark(event.phase).await?;
+        let acknowledgement = serde_json::to_vec(&PhaseAcknowledgement { phase: event.phase })
+            .context("failed to encode an RTC phase acknowledgement")?;
+        input
+            .write_all(&acknowledgement)
+            .await
+            .context("failed to acknowledge an RTC phase")?;
+        input
+            .write_all(b"\n")
+            .await
+            .context("failed to terminate an RTC phase acknowledgement")?;
+        input
+            .flush()
+            .await
+            .context("failed to flush an RTC phase acknowledgement")?;
+        if event.phase == ScenarioPhase::Setup {
+            setup_started = true;
+        }
+    }
+    ensure!(setup_started, "RTC worker omitted the setup phase");
+    phases.finish()
+}
+
+async fn read_phase_frame(output: &mut (impl AsyncBufRead + Unpin)) -> Result<Option<Vec<u8>>> {
+    let mut frame = Vec::new();
+    loop {
+        let available = output
+            .fill_buf()
+            .await
+            .context("failed to read an RTC phase event")?;
+        if available.is_empty() {
+            ensure!(frame.is_empty(), "RTC phase stream ended within an event");
+            return Ok(None);
+        }
+        let consumed = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index.saturating_add(1));
+        ensure!(
+            frame.len().saturating_add(consumed) <= MAX_PHASE_FRAME_BYTES,
+            "RTC phase event exceeds {MAX_PHASE_FRAME_BYTES} bytes"
+        );
+        frame.extend_from_slice(available.get(..consumed).unwrap_or_default());
+        let complete = available.get(consumed.saturating_sub(1)) == Some(&b'\n');
+        output.consume(consumed);
+        if complete {
+            return Ok(Some(frame));
+        }
+    }
+}
+
+fn combine_rtc_and_phases(
+    completion: Result<RtcWaitOutcome>,
+    phase_result: Result<()>,
+) -> Result<RtcWorkerCompletion> {
+    match (completion, phase_result) {
+        (Ok(RtcWaitOutcome::ServerExited(status)), _) => {
+            Ok(RtcWorkerCompletion::ServerExited(status))
+        }
+        (Ok(RtcWaitOutcome::Completed), Ok(())) => Ok(RtcWorkerCompletion::Completed),
+        (Ok(RtcWaitOutcome::Completed | RtcWaitOutcome::PhaseFailed), Err(error))
+        | (Err(error), Ok(())) => Err(error),
+        (Ok(RtcWaitOutcome::PhaseFailed), Ok(())) => {
+            Err(anyhow!("RTC phase stream failed without an error"))
+        }
+        (Err(run_error), Err(phase_error)) => Err(anyhow!(
+            "RTC work failed: {run_error:#}. phase stream also failed: {phase_error:#}"
+        )),
+    }
+}
+
+enum RtcWaitOutcome {
+    Completed,
+    ServerExited(ExitStatus),
+    PhaseFailed,
 }
 
 enum RtcWorkerCompletion {

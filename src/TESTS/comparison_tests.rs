@@ -245,8 +245,8 @@ fn run(
 fn samples(final_ticks: u64, cpu_percent_milli: u64) -> SampleSet {
     parse_samples(&format!(
         r#"
-{{"elapsedMs":0,"status":"sample","clockTicksPerSecond":100,"server":{{"cpuTicks":10,"rssBytes":1048576,"startTimeTicks":5}},"rtc":{{"cpuTicks":20,"rssBytes":2097152,"startTimeTicks":7}},"traffic":{{"forwardedLocalRtc":{{"packets":0}},"egress":{{"payloadBytes":0}}}},"workers":[{{"packetLoopDelayMs":2}}]}}
-{{"elapsedMs":1000,"status":"sample","clockTicksPerSecond":100,"serverCpuPercentMilli":{cpu_percent_milli},"rtcCpuPercentMilli":25000,"server":{{"cpuTicks":{final_ticks},"rssBytes":3145728,"startTimeTicks":5}},"rtc":{{"cpuTicks":30,"rssBytes":4194304,"startTimeTicks":7}},"traffic":{{"forwardedLocalRtc":{{"packets":50}},"egress":{{"payloadBytes":8000}}}},"workers":[{{"packetLoopDelayMs":7}}]}}
+{{"elapsedMs":0,"finalSample":false,"clockTicksPerSecond":100,"server":{{"cpuTicks":10,"rssBytes":1048576,"startTimeTicks":5}},"rtc":{{"cpuTicks":20,"rssBytes":2097152,"startTimeTicks":7}},"traffic":{{"forwardedLocalRtc":{{"packets":0}},"egress":{{"payloadBytes":0}}}},"workers":[{{"mediaWorkerId":0,"egressBitrateBps":0,"packetLoopDelayMs":2,"commandBacklogDepth":0,"relayMailboxDepth":0,"workerPressureScore":0}}]}}
+{{"elapsedMs":1000,"finalSample":true,"clockTicksPerSecond":100,"serverCpuPercentMilli":{cpu_percent_milli},"rtcCpuPercentMilli":25000,"server":{{"cpuTicks":{final_ticks},"rssBytes":3145728,"startTimeTicks":5}},"rtc":{{"cpuTicks":30,"rssBytes":4194304,"startTimeTicks":7}},"traffic":{{"forwardedLocalRtc":{{"packets":50}},"egress":{{"payloadBytes":8000}}}},"workers":[{{"mediaWorkerId":0,"egressBitrateBps":0,"packetLoopDelayMs":7,"commandBacklogDepth":0,"relayMailboxDepth":0,"workerPressureScore":0}}]}}
 "#
     ))
 }
@@ -254,8 +254,8 @@ fn samples(final_ticks: u64, cpu_percent_milli: u64) -> SampleSet {
 fn samples_without_traffic(final_ticks: u64, cpu_percent_milli: u64) -> SampleSet {
     parse_samples(&format!(
         r#"
-{{"elapsedMs":0,"status":"sample","clockTicksPerSecond":100,"server":{{"cpuTicks":10,"rssBytes":1048576,"startTimeTicks":5}},"rtc":{{"cpuTicks":20,"rssBytes":2097152,"startTimeTicks":7}},"workers":[{{"packetLoopDelayMs":2}}]}}
-{{"elapsedMs":1000,"status":"sample","clockTicksPerSecond":100,"serverCpuPercentMilli":{cpu_percent_milli},"rtcCpuPercentMilli":25000,"server":{{"cpuTicks":{final_ticks},"rssBytes":3145728,"startTimeTicks":5}},"rtc":{{"cpuTicks":30,"rssBytes":4194304,"startTimeTicks":7}},"workers":[{{"packetLoopDelayMs":7}}]}}
+{{"elapsedMs":0,"finalSample":false,"clockTicksPerSecond":100,"server":{{"cpuTicks":10,"rssBytes":1048576,"startTimeTicks":5}},"rtc":{{"cpuTicks":20,"rssBytes":2097152,"startTimeTicks":7}},"workers":[{{"mediaWorkerId":0,"egressBitrateBps":0,"packetLoopDelayMs":2,"commandBacklogDepth":0,"relayMailboxDepth":0,"workerPressureScore":0}}]}}
+{{"elapsedMs":1000,"finalSample":true,"clockTicksPerSecond":100,"serverCpuPercentMilli":{cpu_percent_milli},"rtcCpuPercentMilli":25000,"server":{{"cpuTicks":{final_ticks},"rssBytes":3145728,"startTimeTicks":5}},"rtc":{{"cpuTicks":30,"rssBytes":4194304,"startTimeTicks":7}},"workers":[{{"mediaWorkerId":0,"egressBitrateBps":0,"packetLoopDelayMs":7,"commandBacklogDepth":0,"relayMailboxDepth":0,"workerPressureScore":0}}]}}
 "#
     ))
 }

@@ -9,11 +9,12 @@ use std::{
 use anyhow::{Context, Result, ensure};
 
 use crate::report::{
-    ChartSeries, LoadFailure, MAX_INPUTS, RunData, TelemetrySummary, chart_label,
-    delivered_payload_bits_per_second, delivery_rate, ensure_summary_size, escape_table,
-    format_bits_per_second, format_cpu_percent, format_mebibytes, format_milliseconds, load_run,
-    pacing_valid, render_category_charts, render_consumer_context, render_media_profile,
-    render_scenario_legend, scenario_key, scenario_label, validate_artifact_url, validate_run,
+    ChartSeries, DashboardConfig, LoadFailure, MAX_INPUTS, RunData, TelemetrySummary, chart_label,
+    dashboard::write_comparison, delivered_payload_bits_per_second, delivery_rate,
+    ensure_summary_size, escape_table, format_bits_per_second, format_cpu_percent,
+    format_mebibytes, format_milliseconds, load_run, pacing_valid, render_category_charts,
+    render_consumer_context, render_media_profile, render_scenario_legend, scenario_key,
+    scenario_label, validate_artifact_url, validate_run, workload_matches,
 };
 
 struct Side {
@@ -97,8 +98,18 @@ pub fn write(
     comparison_inputs: &[PathBuf],
     output: &Path,
     artifact_url: Option<&str>,
+    dashboards: Option<&DashboardConfig<'_>>,
 ) -> Result<()> {
-    let summary = render(baseline_inputs, comparison_inputs, artifact_url)?;
+    let mut summary = render(baseline_inputs, comparison_inputs, artifact_url)?;
+    if let Some(config) = dashboards {
+        summary.push_str(&write_comparison(
+            baseline_inputs,
+            comparison_inputs,
+            config,
+            artifact_url,
+        )?);
+        ensure_summary_size(&summary)?;
+    }
     if let Some(parent) = output
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -759,18 +770,6 @@ fn pair_runs<'a>(baseline: &'a [RunData], comparison: &'a [RunData]) -> Pairing<
         }
     }
     Pairing { pairs, issues }
-}
-
-fn workload_matches(baseline: &RunData, comparison: &RunData) -> bool {
-    let baseline = &baseline.result;
-    let comparison = &comparison.result;
-    baseline.schema_version == comparison.schema_version
-        && baseline.profile == comparison.profile
-        && baseline.scenario == comparison.scenario
-        && baseline.server_policy == comparison.server_policy
-        && baseline.plan == comparison.plan
-        && baseline.offered_packets == comparison.offered_packets
-        && baseline.offered_payload_bytes == comparison.offered_payload_bytes
 }
 
 fn telemetry(run: &RunData) -> TelemetrySummary {

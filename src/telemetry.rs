@@ -14,13 +14,17 @@ use serde::{Deserialize, Serialize};
 use tokio::{
     fs,
     process::Command,
-    sync::oneshot,
+    sync::{mpsc, oneshot},
     task::JoinHandle,
     time::{Instant as TokioInstant, MissedTickBehavior, interval_at},
 };
 
+use crate::phase::{PhaseSequence, ScenarioPhase};
+
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 const REQUEST_TIMEOUT: Duration = Duration::from_millis(750);
+const SAMPLER_COMMAND_CAPACITY: usize = 8;
+pub(crate) const TELEMETRY_SCHEMA_VERSION: u32 = 2;
 
 const RTP_PACKETS_INGRESS: &str = "osfu_rtp_packets_total{direction=\"ingress\"}";
 const RTP_PACKETS_EGRESS: &str = "osfu_rtp_packets_total{direction=\"egress\"}";
@@ -111,13 +115,20 @@ pub enum TelemetryOutcome {
     Error {
         message: String,
     },
+    Phase {
+        phase: ScenarioPhase,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TelemetryRecord {
+    #[serde(default)]
+    pub schema_version: u32,
     pub elapsed_ms: u64,
+    #[serde(default)]
     pub scrape_duration_ms: u64,
+    #[serde(default)]
     pub final_sample: bool,
     #[serde(flatten)]
     pub outcome: TelemetryOutcome,
@@ -131,8 +142,24 @@ pub struct TelemetrySummary {
 }
 
 pub struct TelemetrySampler {
-    stop: oneshot::Sender<()>,
+    commands: mpsc::Sender<SamplerCommand>,
     task: JoinHandle<Result<TelemetrySummary>>,
+    started_at: Instant,
+}
+
+#[derive(Clone)]
+pub struct TelemetryMarker {
+    commands: mpsc::Sender<SamplerCommand>,
+    started_at: Instant,
+}
+
+enum SamplerCommand {
+    Phase {
+        phase: ScenarioPhase,
+        elapsed_ms: u64,
+        complete: oneshot::Sender<Result<(), String>>,
+    },
+    Finish,
 }
 
 impl TelemetrySampler {
@@ -176,11 +203,24 @@ impl TelemetrySampler {
             sample_count: 0,
             error_count: 0,
             errors: Vec::new(),
+            phases: PhaseSequence::default(),
         };
         state.record(false).await?;
-        let (stop, stop_rx) = oneshot::channel();
-        let task = tokio::spawn(run_sampler(state, stop_rx));
-        Ok(Self { stop, task })
+        let (commands, command_rx) = mpsc::channel(SAMPLER_COMMAND_CAPACITY);
+        let task = tokio::spawn(run_sampler(state, command_rx));
+        Ok(Self {
+            commands,
+            task,
+            started_at,
+        })
+    }
+
+    #[must_use]
+    pub fn marker(&self) -> TelemetryMarker {
+        TelemetryMarker {
+            commands: self.commands.clone(),
+            started_at: self.started_at,
+        }
     }
 
     /// Stops periodic sampling after one final observation.
@@ -192,11 +232,36 @@ impl TelemetrySampler {
     ///
     /// Returns an error when the sampler task or output writer fails.
     pub async fn finish(self) -> Result<TelemetrySummary> {
-        let Self { stop, task } = self;
-        let signaled = stop.send(()).is_ok();
+        let Self { commands, task, .. } = self;
+        let signaled = commands.send(SamplerCommand::Finish).await.is_ok();
+        drop(commands);
         let summary = task.await.context("telemetry sampler task failed")??;
         ensure!(signaled, "telemetry sampler stopped before finish");
         Ok(summary)
+    }
+}
+
+impl TelemetryMarker {
+    /// Records one phase transition on the sampler's monotonic timeline.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the transition is invalid or cannot be persisted.
+    pub async fn mark(&self, phase: ScenarioPhase) -> Result<()> {
+        let (complete, completed) = oneshot::channel();
+        let elapsed_ms = millis(self.started_at.elapsed());
+        self.commands
+            .send(SamplerCommand::Phase {
+                phase,
+                elapsed_ms,
+                complete,
+            })
+            .await
+            .context("telemetry sampler stopped before the phase marker")?;
+        completed
+            .await
+            .context("telemetry sampler dropped the phase marker")?
+            .map_err(anyhow::Error::msg)
     }
 }
 
@@ -246,6 +311,7 @@ struct SamplerState {
     sample_count: usize,
     error_count: usize,
     errors: Vec<String>,
+    phases: PhaseSequence,
 }
 
 impl SamplerState {
@@ -265,12 +331,28 @@ impl SamplerState {
             }
         };
         let record = TelemetryRecord {
+            schema_version: TELEMETRY_SCHEMA_VERSION,
             elapsed_ms,
             scrape_duration_ms: millis(scrape_started.elapsed()),
             final_sample,
             outcome,
         };
-        serde_json::to_writer(&mut self.output, &record)
+        self.write_record(&record)
+    }
+
+    fn record_phase(&mut self, phase: ScenarioPhase, elapsed_ms: u64) -> Result<()> {
+        self.phases.advance(phase)?;
+        self.write_record(&TelemetryRecord {
+            schema_version: TELEMETRY_SCHEMA_VERSION,
+            elapsed_ms,
+            scrape_duration_ms: 0,
+            final_sample: false,
+            outcome: TelemetryOutcome::Phase { phase },
+        })
+    }
+
+    fn write_record(&mut self, record: &TelemetryRecord) -> Result<()> {
+        serde_json::to_writer(&mut self.output, record)
             .context("failed to encode a telemetry record")?;
         self.output
             .write_all(b"\n")
@@ -334,12 +416,13 @@ impl SamplerState {
         })
     }
 
-    fn finish(self) -> TelemetrySummary {
-        TelemetrySummary {
+    fn finish(self) -> Result<TelemetrySummary> {
+        self.phases.finish()?;
+        Ok(TelemetrySummary {
             sample_count: self.sample_count,
             error_count: self.error_count,
             errors: self.errors,
-        }
+        })
     }
 }
 
@@ -395,16 +478,36 @@ fn advance_process_sample(
 
 async fn run_sampler(
     mut state: SamplerState,
-    mut stop: oneshot::Receiver<()>,
+    mut commands: mpsc::Receiver<SamplerCommand>,
 ) -> Result<TelemetrySummary> {
     let mut interval = interval_at(TokioInstant::now() + SAMPLE_INTERVAL, SAMPLE_INTERVAL);
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             biased;
-            _ = &mut stop => {
-                state.record(true).await?;
-                return Ok(state.finish());
+            command = commands.recv() => {
+                match command.context("telemetry command channel closed before finish")? {
+                    SamplerCommand::Phase {
+                        phase,
+                        elapsed_ms,
+                        complete,
+                    } => {
+                        match state.record_phase(phase, elapsed_ms) {
+                            Ok(()) => {
+                                let _result = complete.send(Ok(()));
+                            }
+                            Err(error) => {
+                                let message = format!("{error:#}");
+                                let _result = complete.send(Err(message));
+                                return Err(error);
+                            }
+                        }
+                    }
+                    SamplerCommand::Finish => {
+                        state.record(true).await?;
+                        return state.finish();
+                    }
+                }
             }
             _ = interval.tick() => state.record(false).await?,
         }

@@ -128,8 +128,19 @@ target/release/o-sfu-load \
 ```
 
 Each output directory contains the typed scenario, exact result, child logs and
-one-second telemetry samples. Linux telemetry records separate SFU and RTC CPU
-plus RSS. It also records o-sfu RTP counters and worker pressure diagnostics.
+telemetry at a nominal one-second cadence plus immediate and final samples.
+Linux telemetry records separate SFU and RTC CPU plus RSS. It also records
+o-sfu RTP counters and worker pressure diagnostics. Typed `setup`, `warmup`,
+`measured` and `drain` events share the sampler's monotonic timeline. The
+controller starts telemetry before releasing RTC setup so phase positions do
+not depend on clocks from two processes.
+
+The sampler requests `/metrics` and `/internal/diagnostics/workers` at the
+nominal cadence. Nightly pins the controller with the RTC generator on CPUs 1
+through 3. Controller-side request and parsing work therefore stays on those
+CPUs. The SFU cost of serving both endpoints runs on CPU 0 and is included in
+measured SFU CPU. The worker diagnostics endpoint traverses current diagnostic
+state so revision comparisons must use the same telemetry configuration.
 
 `o-sfu-load-report` combines one or more results into GitHub-flavored Markdown:
 
@@ -137,23 +148,37 @@ plus RSS. It also records o-sfu RTP counters and worker pressure diagnostics.
 target/release/o-sfu-load-report \
   --input artifacts/audio \
   --input artifacts/video \
+  --dashboard-output artifacts/dashboards \
+  --dashboard-asset-stem o-sfu-telemetry-local \
   --output artifacts/summary.md
 ```
 
-The report embeds native Mermaid line charts for observed delivery rate,
-scheduled sender RTP payload versus receiver-observed payload plus SFU CPU
-average, peak and timeline data. Category charts contain at most four scenarios
-per panel and use compact labels. Scenarios within each workload family are
-ordered by planned load. Every panel declares its independent y-axis scale.
-Single-scenario category charts are omitted because their exact table value
-does not define a line. Telemetry timelines remain available when at least two
-buckets were observed.
-The CPU timeline groups real samples into at most 32 equal elapsed-time buckets
-then applies a centered five-bucket moving average. The bucket count shrinks
-when needed so a scrape gap is not filled with invented data. Bucket values and
-the unsmoothed sampled peak remain in the report.
-Tables retain the authoritative counters, packet discrepancies and process
-metrics. Raw JSONL and logs remain available as workflow artifacts.
+This local command writes SVG files to `artifacts/dashboards`. Embedded Actions
+previews additionally require PNG conversion, public upload and
+`--dashboard-url-base`.
+
+The report keeps compact Mermaid lines for cross-scenario delivery, payload and
+CPU aggregates. Plotters generates one detailed 1,800 by 2,600 SVG dashboard
+per scenario after measurement. Each dashboard covers SFU and generator CPU,
+RSS, RTP packets/s, RTP payload Mbit/s, local fanout, worker egress bitrate,
+packet-loop delay, queue depth, worker pressure and telemetry scrape duration.
+
+CPU, traffic and worker-bitrate panels draw faint raw points behind a centered
+moving average over up to five contiguous samples. Smoothed lines exclude
+phase-crossing intervals while each mixed-phase observation remains visible only
+as a point. Missing values, unresponsive worker heartbeats and counter resets
+remain gaps. The scrape panel marks unavailable observations in red. Phase
+markers show where setup, warmup, measured work and drain begin. Observed fanout
+uses adjacent forwarded-local and ingress packet deltas. Expected fanout is the
+whole-workload ratio of planned deliveries to offered packets. Tables retain
+unsmoothed peaks, whole-window aggregates and exact delivery counters. Raw
+JSONL, SVG dashboards and logs remain available in the workflow artifact.
+
+The workflow converts SVGs to PNG only after all measured work has finished. A
+separate publisher validates each PNG then uploads it to the
+`load-test-assets` prerelease before the image is embedded in the Actions
+summary. No Prometheus or Grafana process competes with the SFU on the four
+assigned logical CPUs.
 
 The comparison mode pairs the same scenario from two revisions:
 
@@ -161,15 +186,19 @@ The comparison mode pairs the same scenario from two revisions:
 target/release/o-sfu-load-report \
   --baseline-input artifacts/baseline/audio \
   --comparison-input artifacts/comparison/audio \
+  --dashboard-output artifacts/dashboards \
+  --dashboard-asset-stem o-sfu-telemetry-comparison \
   --output artifacts/summary.md
 ```
 
-It requires identical scenario, profile, server policy and workload plans.
+The report marks a comparison valid only when its complete workload contract
+matches.
 Each comparison graph draws baseline and comparison as two lines on one
-scenario axis. Tables show comparison-minus-baseline deltas beside exact
-delivery evidence. The report includes a label legend. For example
-`video-gallery-1x64-10p-60s` means one room with 64 peers, 10 video publishers
-per room and a 60 second workload.
+scenario axis. Each detailed scenario dashboard is rendered once per revision
+with identical time and value axes. Tables show comparison-minus-baseline
+deltas beside exact delivery evidence. The report includes a label legend. For
+example `video-gallery-1x64-10p-60s` means one room with 64 peers, 10 video
+publishers per room and a 60 second workload.
 
 ## CPU profiling
 
@@ -191,14 +220,14 @@ The postprocessor expects `perf`, `inferno-collapse-perf` and
 The flamegraph, `perf.data`, folded stacks, profiled server binary and raw perf
 reports are retained in the workflow artifact. The profile summary also records
 the runner CPU model, logical CPU count, kernel, tool versions and maximum stack
-depth. A separate publisher job validates each PNG preview and uploads it as a
-run-specific asset on the `load-test-assets` prerelease. This gives the job
-summary a public image URL without granting write access to the load process.
-Later publisher runs remove preview assets older than 30 days. The complete
-workflow artifact retains the interactive SVG, ranked breakdown and raw
-evidence. If the hosted runner denies performance-counter access then the
-ordinary load report remains valid and the profile section records that
-profiling was unavailable.
+depth. The separate publisher job validates telemetry and flamegraph PNG
+previews then uploads them as run-specific assets on the `load-test-assets`
+prerelease. This gives the job summary public image URLs without granting write
+access to the load process. Later publisher runs remove preview assets older
+than 30 days. The complete workflow artifact retains interactive SVGs, ranked
+breakdowns and raw evidence. If the hosted runner denies performance-counter
+access then the ordinary load report remains valid and the profile section
+records that profiling was unavailable.
 
 Profiling is a qualitative diagnostic replay. Debug information plus frame
 pointers and sampling affect that replay so its timings are excluded from the
@@ -242,7 +271,8 @@ audio workload for each revision.
 
 Comparison graphs cover receiver deliveries, receiver-observed RTP payload,
 SFU CPU time per million deliveries, generator send lag, packet-loop delay,
-SFU CPU average and SFU peak RSS. Tables also retain sampled CPU peaks, RTC CPU,
+SFU CPU average and SFU peak RSS. Per-revision dashboards add every time series
+listed above with shared axes. Tables also retain sampled CPU peaks, RTC CPU,
 RTC RSS, SFU forwarding rate and sampled egress payload. CPU time per million
 uses process CPU ticks across the telemetry window. That window includes setup,
 warmup, measured work and drain.

@@ -70,8 +70,26 @@ jobs:
         env:
           ARTIFACT_URL: ${{ steps.smoke-artifact.outputs.artifact-url }}
         run: |
+          set -euo pipefail
+
           summary=artifacts/summary.md
+          dashboard_summary=artifacts/dashboard-summary.md
+          dashboard_directory=artifacts/smoke-dashboards
+          dashboard_stem=o-sfu-telemetry-ci
           if [[ -x target/release/o-sfu-load-report ]]; then
+            dashboard_args=(
+              --input artifacts/smoke
+              --output "$dashboard_summary"
+              --dashboard-output "$dashboard_directory"
+              --dashboard-asset-stem "$dashboard_stem"
+            )
+            target/release/o-sfu-load-report "${dashboard_args[@]}"
+
+            dashboard="$dashboard_directory/$dashboard_stem-single-smoke-1r-50p.svg"
+            [[ -f "$dashboard" && ! -L "$dashboard" ]]
+            grep -Fq 'Process CPU' "$dashboard"
+            grep -Fq '## Telemetry dashboards' "$dashboard_summary"
+
             args=(--input artifacts/smoke --output "$summary")
             if [[ -n "$ARTIFACT_URL" ]]; then
               args+=(--artifact-url "$ARTIFACT_URL")

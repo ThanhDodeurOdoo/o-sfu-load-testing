@@ -4,6 +4,7 @@ use std::{
     fs,
     io::ErrorKind,
     path::{Path, PathBuf},
+    result::Result as StdResult,
 };
 
 use anyhow::{Context, Result, ensure};
@@ -12,12 +13,18 @@ use serde_json::Value;
 use crate::{
     AUDIO_PACKET_PAYLOAD_BYTES, AUDIO_PACKETS_PER_SECOND, ScenarioResult, ScenarioSpec,
     VIDEO_FRAMES_PER_SECOND, VIDEO_HIGH_PACKET_PAYLOAD_BYTES, VIDEO_KEYFRAME_INTERVAL,
-    VIDEO_LOW_PACKET_PAYLOAD_BYTES, video_packets_per_layer,
+    VIDEO_LOW_PACKET_PAYLOAD_BYTES,
+    phase::ScenarioPhase,
+    telemetry::{
+        TELEMETRY_SCHEMA_VERSION, TelemetryOutcome, TelemetryRecord, WorkerPressureSample,
+    },
+    video_packets_per_layer,
 };
 
+pub(crate) mod dashboard;
+pub use dashboard::DashboardConfig;
+
 const CATEGORY_CHART_POINTS: usize = 4;
-const CPU_SMOOTHING_RADIUS: usize = 2;
-const CPU_TIMELINE_POINTS: usize = 32;
 const GITHUB_SUMMARY_LIMIT_BYTES: usize = 1024 * 1024;
 const RESULT_LIMIT_BYTES: u64 = 1024 * 1024;
 const SAMPLES_LIMIT_BYTES: u64 = 16 * 1024 * 1024;
@@ -25,6 +32,7 @@ pub(crate) const MAX_INPUTS: usize = 256;
 pub(crate) const MAX_CHART_SCENARIOS: usize = 12;
 const MAX_TELEMETRY_SAMPLES: usize = 10_000;
 const MAX_TELEMETRY_ERRORS: usize = 8;
+const MAX_TELEMETRY_WORKERS: usize = 64;
 const MAX_MERMAID_INTEGER: u64 = 9_007_199_254_740_991;
 const LINE_COLORS: [(&str, &str); 2] = [("Blue", "#388BFD"), ("Orange", "#B86E00")];
 
@@ -43,13 +51,17 @@ pub(crate) struct LoadFailure {
 #[derive(Clone)]
 pub(crate) struct SampleSet {
     samples: Vec<TelemetrySample>,
+    phases: Vec<PhaseMarker>,
     unavailable: usize,
     errors: Vec<String>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Default)]
 struct TelemetrySample {
     elapsed_ms: u64,
+    is_gap: bool,
+    final_sample: Option<bool>,
+    scrape_duration_ms: Option<u64>,
     clock_ticks_per_second: Option<u64>,
     server_cpu_ticks: Option<u64>,
     server_start_time_ticks: Option<u64>,
@@ -58,10 +70,30 @@ struct TelemetrySample {
     rtc_rss_bytes: Option<u64>,
     server_cpu_percent_milli: Option<u64>,
     rtc_cpu_percent_milli: Option<u64>,
+    ingress_packets: Option<u64>,
+    ingress_payload_bytes: Option<u64>,
+    egress_packets: Option<u64>,
     forwarded_packets: Option<u64>,
     egress_payload_bytes: Option<u64>,
+    forwarded_payload_bytes: Option<u64>,
+    workers: Vec<WorkerTelemetry>,
     packet_loop_delay_ms: Option<u64>,
     packet_loop_unresponsive: bool,
+}
+
+#[derive(Clone, Copy)]
+struct WorkerTelemetry {
+    media_worker_id: usize,
+    egress_bitrate_bps: u64,
+    command_backlog_depth: usize,
+    relay_mailbox_depth: usize,
+    worker_pressure_score: u8,
+}
+
+#[derive(Clone, Copy)]
+struct PhaseMarker {
+    elapsed_ms: u64,
+    phase: ScenarioPhase,
 }
 
 pub(crate) struct TelemetrySummary {
@@ -86,11 +118,6 @@ pub(crate) struct TelemetrySummary {
 pub(crate) struct ChartSeries<'a> {
     pub(crate) name: &'a str,
     pub(crate) values: &'a [u64],
-}
-
-struct Timeline {
-    elapsed_ms: u64,
-    values: Vec<u64>,
 }
 
 /// Renders one GitHub job summary from result files or result directories.
@@ -128,8 +155,17 @@ pub fn render(inputs: &[PathBuf], artifact_url: Option<&str>) -> Result<String> 
 /// # Errors
 ///
 /// Returns an error when rendering, directory creation or persistence fails.
-pub fn write(inputs: &[PathBuf], output: &Path, artifact_url: Option<&str>) -> Result<()> {
-    let summary = render(inputs, artifact_url)?;
+pub fn write(
+    inputs: &[PathBuf],
+    output: &Path,
+    artifact_url: Option<&str>,
+    dashboards: Option<&DashboardConfig<'_>>,
+) -> Result<()> {
+    let mut summary = render(inputs, artifact_url)?;
+    if let Some(config) = dashboards {
+        summary.push_str(&dashboard::write_single(inputs, config, artifact_url)?);
+        ensure_summary_size(&summary)?;
+    }
     if let Some(parent) = output
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -205,26 +241,42 @@ fn read_optional_bounded(path: &Path, limit: u64) -> Result<Option<String>> {
 
 pub(crate) fn parse_samples(payload: &str) -> SampleSet {
     let mut samples = Vec::new();
+    let mut phases = Vec::new();
     let mut unavailable = 0_usize;
     let mut errors = Vec::new();
+    let mut records = 0_usize;
+    let mut phases_required = false;
     for line in payload
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
     {
-        if samples.len() >= MAX_TELEMETRY_SAMPLES {
+        if records >= MAX_TELEMETRY_SAMPLES {
             unavailable = unavailable.saturating_add(1);
             retain_error(&mut errors, "telemetry sample limit reached".to_owned());
             continue;
         }
+        records = records.saturating_add(1);
         match serde_json::from_str::<Value>(line) {
-            Ok(value) => {
+            Ok(value) if value.get("status").is_none() => {
                 if let Some(sample) = TelemetrySample::from_value(&value) {
                     samples.push(sample);
                 } else {
                     unavailable = unavailable.saturating_add(1);
                     retain_error(&mut errors, telemetry_error(&value));
+                    if let Some(sample) = TelemetrySample::gap_from_value(&value) {
+                        samples.push(sample);
+                    }
                 }
+            }
+            Ok(value) => {
+                phases_required |= parse_current_record(
+                    value,
+                    &mut samples,
+                    &mut phases,
+                    &mut unavailable,
+                    &mut errors,
+                );
             }
             Err(error) => {
                 unavailable = unavailable.saturating_add(1);
@@ -232,12 +284,84 @@ pub(crate) fn parse_samples(payload: &str) -> SampleSet {
             }
         }
     }
-    samples.sort_unstable_by_key(|sample| sample.elapsed_ms);
+    if (phases_required || !phases.is_empty()) && phases.len() != ScenarioPhase::COUNT {
+        unavailable = unavailable.saturating_add(1);
+        retain_error(
+            &mut errors,
+            "telemetry phase sequence is incomplete".to_owned(),
+        );
+    }
+    samples.sort_by_key(|sample| sample.elapsed_ms);
     SampleSet {
         samples,
+        phases,
         unavailable,
         errors,
     }
+}
+
+fn parse_current_record(
+    value: Value,
+    samples: &mut Vec<TelemetrySample>,
+    phases: &mut Vec<PhaseMarker>,
+    unavailable: &mut usize,
+    errors: &mut Vec<String>,
+) -> bool {
+    let final_sample = value.get("finalSample").and_then(Value::as_bool);
+    let gap = TelemetrySample::gap_from_value(&value);
+    let record = match serde_json::from_value::<TelemetryRecord>(value) {
+        Ok(record) => record,
+        Err(error) => {
+            *unavailable = unavailable.saturating_add(1);
+            retain_error(errors, format!("malformed telemetry record: {error}"));
+            if let Some(sample) = gap {
+                samples.push(sample);
+            }
+            return false;
+        }
+    };
+    let TelemetryRecord {
+        schema_version,
+        elapsed_ms,
+        scrape_duration_ms,
+        outcome,
+        final_sample: _,
+    } = record;
+    match outcome {
+        outcome @ TelemetryOutcome::Sample { .. } => {
+            if let Some(sample) =
+                TelemetrySample::from_current(elapsed_ms, scrape_duration_ms, final_sample, outcome)
+            {
+                samples.push(sample);
+            } else {
+                *unavailable = unavailable.saturating_add(1);
+                retain_error(
+                    errors,
+                    "telemetry sample contains invalid worker data".to_owned(),
+                );
+                if let Some(sample) = gap {
+                    samples.push(sample);
+                }
+            }
+        }
+        TelemetryOutcome::Error { message } => {
+            *unavailable = unavailable.saturating_add(1);
+            retain_error(errors, message);
+            if let Some(sample) = gap {
+                samples.push(sample);
+            }
+        }
+        TelemetryOutcome::Phase { phase } => {
+            match PhaseMarker::new(elapsed_ms, phase, phases.last()) {
+                Ok(marker) => phases.push(marker),
+                Err(error) => {
+                    *unavailable = unavailable.saturating_add(1);
+                    retain_error(errors, error);
+                }
+            }
+        }
+    }
+    schema_version >= TELEMETRY_SCHEMA_VERSION
 }
 
 fn retain_error(errors: &mut Vec<String>, error: String) {
@@ -254,12 +378,92 @@ fn telemetry_error(value: &Value) -> String {
 }
 
 impl TelemetrySample {
-    fn from_value(value: &Value) -> Option<Self> {
-        if value.get("status").and_then(Value::as_str) == Some("error") {
+    fn gap_from_value(value: &Value) -> Option<Self> {
+        Some(Self {
+            elapsed_ms: value.get("elapsedMs")?.as_u64()?,
+            is_gap: true,
+            final_sample: value.get("finalSample").and_then(Value::as_bool),
+            scrape_duration_ms: value.get("scrapeDurationMs").and_then(Value::as_u64),
+            ..Self::default()
+        })
+    }
+
+    fn from_current(
+        elapsed_ms: u64,
+        scrape_duration_ms: u64,
+        final_sample: Option<bool>,
+        outcome: TelemetryOutcome,
+    ) -> Option<Self> {
+        let TelemetryOutcome::Sample {
+            clock_ticks_per_second,
+            server_cpu_percent_milli,
+            rtc_cpu_percent_milli,
+            server_rss_bytes,
+            rtc_rss_bytes,
+            server,
+            rtc,
+            traffic,
+            workers,
+        } = outcome
+        else {
             return None;
-        }
+        };
+        let packet_loop_unresponsive = workers
+            .iter()
+            .any(|worker| worker.packet_loop_delay_ms.is_none());
+        let packet_loop_delay_ms = (!packet_loop_unresponsive)
+            .then(|| {
+                workers
+                    .iter()
+                    .filter_map(|worker| worker.packet_loop_delay_ms)
+                    .max()
+            })
+            .flatten();
+        let workers = WorkerTelemetry::from_current(&workers)?;
+        Some(Self {
+            elapsed_ms,
+            is_gap: false,
+            final_sample,
+            scrape_duration_ms: Some(scrape_duration_ms),
+            clock_ticks_per_second: Some(clock_ticks_per_second),
+            server_cpu_ticks: Some(server.cpu_ticks),
+            server_start_time_ticks: Some(server.start_time_ticks),
+            server_rss_bytes: Some(server_rss_bytes),
+            rtc_cpu_ticks: rtc.map(|sample| sample.cpu_ticks),
+            rtc_rss_bytes,
+            server_cpu_percent_milli,
+            rtc_cpu_percent_milli,
+            ingress_packets: Some(traffic.ingress.packets),
+            ingress_payload_bytes: Some(traffic.ingress.payload_bytes),
+            egress_packets: Some(traffic.egress.packets),
+            forwarded_packets: Some(traffic.forwarded_local_rtc.packets),
+            egress_payload_bytes: Some(traffic.egress.payload_bytes),
+            forwarded_payload_bytes: Some(traffic.forwarded_local_rtc.payload_bytes),
+            workers,
+            packet_loop_delay_ms,
+            packet_loop_unresponsive,
+        })
+    }
+
+    fn from_value(value: &Value) -> Option<Self> {
+        let workers = match value.get("workers") {
+            Some(workers) => WorkerTelemetry::from_values(workers.as_array()?)?,
+            None => Vec::new(),
+        };
+        let packet_loop_unresponsive =
+            value
+                .get("workers")
+                .and_then(Value::as_array)
+                .is_some_and(|workers| {
+                    workers
+                        .iter()
+                        .any(|worker| worker.get("packetLoopDelayMs").is_some_and(Value::is_null))
+                });
         let sample = Self {
             elapsed_ms: value.get("elapsedMs")?.as_u64()?,
+            is_gap: false,
+            final_sample: value.get("finalSample").and_then(Value::as_bool),
+            scrape_duration_ms: value.get("scrapeDurationMs").and_then(Value::as_u64),
             clock_ticks_per_second: value.get("clockTicksPerSecond").and_then(Value::as_u64),
             server_cpu_ticks: nested_u64(value, "server", "cpuTicks"),
             server_start_time_ticks: nested_u64(value, "server", "startTimeTicks"),
@@ -270,32 +474,28 @@ impl TelemetrySample {
                 .or_else(|| value.get("rtcRssBytes").and_then(Value::as_u64)),
             server_cpu_percent_milli: value.get("serverCpuPercentMilli").and_then(Value::as_u64),
             rtc_cpu_percent_milli: value.get("rtcCpuPercentMilli").and_then(Value::as_u64),
-            forwarded_packets: value
-                .get("traffic")
-                .and_then(|traffic| traffic.get("forwardedLocalRtc"))
-                .and_then(|forwarded| forwarded.get("packets"))
-                .and_then(Value::as_u64),
-            egress_payload_bytes: value
-                .get("traffic")
-                .and_then(|traffic| traffic.get("egress"))
-                .and_then(|egress| egress.get("payloadBytes"))
-                .and_then(Value::as_u64),
-            packet_loop_delay_ms: value.get("workers").and_then(Value::as_array).and_then(
-                |workers| {
-                    workers
-                        .iter()
-                        .filter_map(|worker| worker.get("packetLoopDelayMs"))
-                        .filter_map(Value::as_u64)
-                        .max()
-                },
-            ),
-            packet_loop_unresponsive: value.get("workers").and_then(Value::as_array).is_some_and(
-                |workers| {
-                    workers
-                        .iter()
-                        .any(|worker| worker.get("packetLoopDelayMs").is_some_and(Value::is_null))
-                },
-            ),
+            ingress_packets: traffic_u64(value, "ingress", "packets"),
+            ingress_payload_bytes: traffic_u64(value, "ingress", "payloadBytes"),
+            egress_packets: traffic_u64(value, "egress", "packets"),
+            forwarded_packets: traffic_u64(value, "forwardedLocalRtc", "packets"),
+            egress_payload_bytes: traffic_u64(value, "egress", "payloadBytes"),
+            forwarded_payload_bytes: traffic_u64(value, "forwardedLocalRtc", "payloadBytes"),
+            workers,
+            packet_loop_delay_ms: (!packet_loop_unresponsive)
+                .then(|| {
+                    value
+                        .get("workers")
+                        .and_then(Value::as_array)
+                        .and_then(|workers| {
+                            workers
+                                .iter()
+                                .filter_map(|worker| worker.get("packetLoopDelayMs"))
+                                .filter_map(Value::as_u64)
+                                .max()
+                        })
+                })
+                .flatten(),
+            packet_loop_unresponsive,
         };
         (sample.server_cpu_ticks.is_some()
             || sample.server_rss_bytes.is_some()
@@ -303,11 +503,93 @@ impl TelemetrySample {
             || sample.rtc_rss_bytes.is_some()
             || sample.server_cpu_percent_milli.is_some()
             || sample.rtc_cpu_percent_milli.is_some()
+            || sample.ingress_packets.is_some()
+            || sample.ingress_payload_bytes.is_some()
+            || sample.egress_packets.is_some()
             || sample.forwarded_packets.is_some()
             || sample.egress_payload_bytes.is_some()
+            || sample.forwarded_payload_bytes.is_some()
+            || !sample.workers.is_empty()
             || sample.packet_loop_delay_ms.is_some()
-            || sample.packet_loop_unresponsive)
-            .then_some(sample)
+            || sample.packet_loop_unresponsive
+            || sample.scrape_duration_ms.is_some())
+        .then_some(sample)
+    }
+}
+
+impl WorkerTelemetry {
+    fn from_values(values: &[Value]) -> Option<Vec<Self>> {
+        if values.len() > MAX_TELEMETRY_WORKERS {
+            return None;
+        }
+        let workers = values
+            .iter()
+            .map(Self::from_value)
+            .collect::<Option<Vec<_>>>()?;
+        Self::valid(&workers).then_some(workers)
+    }
+
+    fn from_current(values: &[WorkerPressureSample]) -> Option<Vec<Self>> {
+        if values.len() > MAX_TELEMETRY_WORKERS {
+            return None;
+        }
+        let workers = values
+            .iter()
+            .map(|worker| Self {
+                media_worker_id: worker.media_worker_id,
+                egress_bitrate_bps: worker.egress_bitrate_bps,
+                command_backlog_depth: worker.command_backlog_depth,
+                relay_mailbox_depth: worker.relay_mailbox_depth,
+                worker_pressure_score: worker.worker_pressure_score,
+            })
+            .collect::<Vec<_>>();
+        Self::valid(&workers).then_some(workers)
+    }
+
+    fn from_value(value: &Value) -> Option<Self> {
+        Some(Self {
+            media_worker_id: usize::try_from(value.get("mediaWorkerId")?.as_u64()?).ok()?,
+            egress_bitrate_bps: value.get("egressBitrateBps")?.as_u64()?,
+            command_backlog_depth: usize::try_from(value.get("commandBacklogDepth")?.as_u64()?)
+                .ok()?,
+            relay_mailbox_depth: usize::try_from(value.get("relayMailboxDepth")?.as_u64()?).ok()?,
+            worker_pressure_score: u8::try_from(value.get("workerPressureScore")?.as_u64()?)
+                .ok()?,
+        })
+    }
+
+    fn valid(workers: &[Self]) -> bool {
+        workers
+            .iter()
+            .all(|worker| worker.media_worker_id < MAX_TELEMETRY_WORKERS)
+            && workers
+                .iter()
+                .map(|worker| worker.media_worker_id)
+                .collect::<BTreeSet<_>>()
+                .len()
+                == workers.len()
+    }
+}
+
+impl PhaseMarker {
+    fn new(
+        elapsed_ms: u64,
+        phase: ScenarioPhase,
+        previous: Option<&Self>,
+    ) -> StdResult<Self, String> {
+        let ordinal = previous.map_or(0, |marker| marker.phase.ordinal().saturating_add(1));
+        let expected = ScenarioPhase::ORDERED
+            .get(ordinal)
+            .ok_or_else(|| "telemetry contains more than four phase markers".to_owned())?;
+        if phase != *expected {
+            return Err(format!(
+                "telemetry phase is out of order: expected {expected}, got {phase}"
+            ));
+        }
+        if previous.is_some_and(|previous| elapsed_ms < previous.elapsed_ms) {
+            return Err("telemetry phase elapsed time moved backwards".to_owned());
+        }
+        Ok(Self { elapsed_ms, phase })
     }
 }
 
@@ -336,16 +618,21 @@ impl TelemetrySummary {
         let samples = &sample_set.samples;
         let server_cpu_ticks = server_cpu_ticks(samples);
         Self {
-            samples: samples.len(),
+            samples: samples.iter().filter(|sample| !sample.is_gap).count(),
             unavailable: sample_set.unavailable,
             elapsed_ms: samples.last().map(|sample| sample.elapsed_ms),
             server_ticks_observed: samples
                 .iter()
                 .any(|sample| sample.server_cpu_ticks.is_some()),
             rtc_ticks_observed: samples.iter().any(|sample| sample.rtc_cpu_ticks.is_some()),
-            server_cpu_percent_milli: weighted_average(samples, |sample| {
-                sample.server_cpu_percent_milli
-            }),
+            server_cpu_percent_milli: whole_window_average(
+                samples,
+                |sample| sample.server_cpu_ticks.is_some(),
+                |sample| {
+                    sample.server_cpu_ticks.is_some() && sample.server_cpu_percent_milli.is_some()
+                },
+                |sample| sample.server_cpu_percent_milli,
+            ),
             server_cpu_peak_percent_milli: samples
                 .iter()
                 .filter_map(|sample| sample.server_cpu_percent_milli)
@@ -354,7 +641,12 @@ impl TelemetrySummary {
                 .iter()
                 .filter_map(|sample| sample.server_rss_bytes)
                 .max(),
-            rtc_cpu_percent_milli: weighted_average(samples, |sample| sample.rtc_cpu_percent_milli),
+            rtc_cpu_percent_milli: whole_window_average(
+                samples,
+                |sample| sample.rtc_cpu_ticks.is_some(),
+                |sample| sample.rtc_cpu_ticks.is_some() && sample.rtc_cpu_percent_milli.is_some(),
+                |sample| sample.rtc_cpu_percent_milli,
+            ),
             rtc_rss_bytes: samples
                 .iter()
                 .filter_map(|sample| sample.rtc_rss_bytes)
@@ -395,46 +687,76 @@ fn nested_u64(value: &Value, object: &str, field: &str) -> Option<u64> {
     value.get(object)?.get(field)?.as_u64()
 }
 
-fn weighted_average(
+fn traffic_u64(value: &Value, direction: &str, field: &str) -> Option<u64> {
+    value.get("traffic")?.get(direction)?.get(field)?.as_u64()
+}
+
+fn whole_window_endpoints(
     samples: &[TelemetrySample],
+) -> Option<(&TelemetrySample, &TelemetrySample)> {
+    let initial = samples.first()?;
+    let final_sample = samples.last()?;
+    (!initial.is_gap
+        && initial.final_sample == Some(false)
+        && !final_sample.is_gap
+        && final_sample.final_sample == Some(true)
+        && final_sample.elapsed_ms > initial.elapsed_ms)
+        .then_some((initial, final_sample))
+}
+
+fn whole_window_average(
+    samples: &[TelemetrySample],
+    initial_usable: fn(&TelemetrySample) -> bool,
+    final_usable: fn(&TelemetrySample) -> bool,
     value: fn(&TelemetrySample) -> Option<u64>,
 ) -> Option<u64> {
-    let mut previous_elapsed_ms = None;
+    let (initial, final_sample) = whole_window_endpoints(samples)?;
+    if !initial_usable(initial) || !final_usable(final_sample) {
+        return None;
+    }
+    let elapsed_ms = final_sample.elapsed_ms.checked_sub(initial.elapsed_ms)?;
+    let mut previous_elapsed_ms = initial.elapsed_ms;
     let mut weighted_sum = 0_u128;
     let mut total_weight = 0_u128;
-    for sample in samples {
-        if let Some(previous) = previous_elapsed_ms {
-            let weight = sample.elapsed_ms.saturating_sub(previous);
-            if weight > 0
-                && let Some(value) = value(sample)
-            {
-                weighted_sum = weighted_sum.saturating_add(u128::from(value) * u128::from(weight));
-                total_weight = total_weight.saturating_add(u128::from(weight));
-            }
+    for sample in samples.iter().skip(1) {
+        if sample.is_gap {
+            continue;
         }
-        previous_elapsed_ms = Some(sample.elapsed_ms);
+        let weight = sample.elapsed_ms.checked_sub(previous_elapsed_ms)?;
+        if weight > 0
+            && let Some(value) = value(sample)
+        {
+            weighted_sum = weighted_sum.saturating_add(u128::from(value) * u128::from(weight));
+            total_weight = total_weight.saturating_add(u128::from(weight));
+        }
+        previous_elapsed_ms = sample.elapsed_ms;
     }
-    (total_weight > 0)
+    (total_weight == u128::from(elapsed_ms))
         .then(|| weighted_sum / total_weight)
         .and_then(|average| u64::try_from(average).ok())
 }
 
 fn server_cpu_ticks(samples: &[TelemetrySample]) -> Option<(u64, u64)> {
-    let first = samples.iter().find_map(|sample| {
-        Some((
-            sample.server_cpu_ticks?,
-            sample.server_start_time_ticks?,
-            sample.clock_ticks_per_second?,
-        ))
-    })?;
-    let last = samples.iter().rev().find_map(|sample| {
-        let ticks = sample.server_cpu_ticks?;
-        let start_time = sample.server_start_time_ticks?;
-        let ticks_per_second = sample.clock_ticks_per_second?;
-        (start_time == first.1 && ticks_per_second == first.2).then_some((ticks, ticks_per_second))
-    })?;
-    let delta = last.0.checked_sub(first.0)?;
-    (delta > 0 && last.1 > 0).then_some((delta, last.1))
+    let usable = |sample: &TelemetrySample| {
+        sample.server_cpu_ticks.is_some()
+            && sample.server_start_time_ticks.is_some()
+            && sample.clock_ticks_per_second.is_some()
+    };
+    let (initial, final_sample) = whole_window_endpoints(samples)?;
+    if !usable(initial) || !usable(final_sample) {
+        return None;
+    }
+    let initial_ticks = initial.server_cpu_ticks?;
+    let start_time = initial.server_start_time_ticks?;
+    let ticks_per_second = initial.clock_ticks_per_second?;
+    if final_sample.server_start_time_ticks? != start_time
+        || final_sample.clock_ticks_per_second? != ticks_per_second
+        || ticks_per_second == 0
+    {
+        return None;
+    }
+    let delta = final_sample.server_cpu_ticks?.checked_sub(initial_ticks)?;
+    (delta > 0).then_some((delta, ticks_per_second))
 }
 
 fn cpu_micros_per_million(
@@ -455,18 +777,9 @@ fn counter_rate(
     value: fn(&TelemetrySample) -> Option<u64>,
     scale: u64,
 ) -> Option<u64> {
-    let first = samples
-        .iter()
-        .find_map(|sample| value(sample).map(|value| (sample.elapsed_ms, value)))?;
-    let last = samples
-        .iter()
-        .rev()
-        .find_map(|sample| value(sample).map(|value| (sample.elapsed_ms, value)))?;
-    let elapsed_ms = last.0.checked_sub(first.0)?;
-    let delta = last.1.checked_sub(first.1)?;
-    if elapsed_ms == 0 {
-        return None;
-    }
+    let (initial, final_sample) = whole_window_endpoints(samples)?;
+    let elapsed_ms = final_sample.elapsed_ms.checked_sub(initial.elapsed_ms)?;
+    let delta = value(final_sample)?.checked_sub(value(initial)?)?;
     let rate = u128::from(delta) * u128::from(scale) / u128::from(elapsed_ms);
     Some(u64::try_from(rate).unwrap_or(u64::MAX))
 }
@@ -906,7 +1219,6 @@ fn render_telemetry(output: &mut String, runs: &[RunData]) -> Result<()> {
             .map(|run| chart_label(run.result.scenario))
             .collect::<Vec<_>>();
         render_cpu_overview(output, &summaries, &chart_labels)?;
-        render_cpu_timeline(output, runs)?;
     }
     render_metric_table(output, &summaries)?;
     render_telemetry_issues(output, runs)?;
@@ -970,139 +1282,6 @@ fn render_cpu_overview(
             },
         ],
     )
-}
-
-fn render_cpu_timeline(output: &mut String, runs: &[RunData]) -> Result<()> {
-    let Some((_peak, run, samples)) = runs
-        .iter()
-        .filter_map(|run| {
-            let samples = &run.samples.as_ref()?.samples;
-            let peak = samples
-                .iter()
-                .filter_map(|sample| sample.server_cpu_percent_milli)
-                .max()?;
-            Some((peak, run, samples))
-        })
-        .max_by_key(|(peak, _run, _samples)| *peak)
-    else {
-        return Ok(());
-    };
-    let timeline = cpu_series(samples);
-    let values = moving_average(&timeline.values, CPU_SMOOTHING_RADIUS)
-        .into_iter()
-        .map(|value| rounded_div(value, 1_000))
-        .collect::<Vec<_>>();
-    let bucket_values = timeline
-        .values
-        .into_iter()
-        .map(|value| rounded_div(value, 1_000))
-        .collect::<Vec<_>>();
-    let title = format!("SFU CPU timeline: {}", scenario_label(run.result.scenario));
-    render_cpu_timeline_chart(
-        output,
-        &title,
-        "Real samples are averaged within equal elapsed-time buckets. The bucket count shrinks instead of interpolating across an empty bucket. The line is a centered five-bucket moving average for the highest-CPU scenario. The sampled peak remains authoritative in the table.",
-        timeline.elapsed_ms.div_ceil(1_000).max(1),
-        &values,
-    )?;
-    write!(output, "CPU values by elapsed-time bucket (%): ")?;
-    write_indexed_values(output, &bucket_values)?;
-    write!(output, "\nSmoothed CPU values by sample bucket (%): ")?;
-    write_indexed_values(output, &values)?;
-    writeln!(output, "\n")?;
-    Ok(())
-}
-
-fn write_indexed_values(output: &mut String, values: &[u64]) -> Result<()> {
-    for (index, value) in values.iter().enumerate() {
-        if index > 0 {
-            write!(output, ", ")?;
-        }
-        write!(output, "{index}={value}")?;
-    }
-    Ok(())
-}
-
-fn cpu_series(samples: &[TelemetrySample]) -> Timeline {
-    let points = samples
-        .iter()
-        .filter_map(|sample| Some((sample.elapsed_ms, sample.server_cpu_percent_milli?)))
-        .collect::<Vec<_>>();
-    point_series(&points)
-}
-
-fn point_series(points: &[(u64, u64)]) -> Timeline {
-    let Some((first_ms, first_value)) = points.first().copied() else {
-        return Timeline {
-            elapsed_ms: 0,
-            values: Vec::new(),
-        };
-    };
-    let Some((last_ms, _last_value)) = points.last().copied() else {
-        return Timeline {
-            elapsed_ms: 0,
-            values: Vec::new(),
-        };
-    };
-    let elapsed_ms = last_ms.saturating_sub(first_ms);
-    let maximum_buckets = points.len().min(CPU_TIMELINE_POINTS);
-    if maximum_buckets == 1 || elapsed_ms == 0 {
-        return Timeline {
-            elapsed_ms,
-            values: vec![first_value],
-        };
-    }
-    for buckets in (1..=maximum_buckets).rev() {
-        let mut sums = vec![0_u128; buckets];
-        let mut counts = vec![0_u64; buckets];
-        for (sample_ms, value) in points {
-            let offset = sample_ms.saturating_sub(first_ms);
-            let index = usize::try_from(
-                u128::from(offset) * u128::try_from(buckets).unwrap_or(u128::MAX)
-                    / (u128::from(elapsed_ms) + 1),
-            )
-            .unwrap_or(buckets - 1)
-            .min(buckets - 1);
-            if let (Some(sum), Some(count)) = (sums.get_mut(index), counts.get_mut(index)) {
-                *sum = sum.saturating_add(u128::from(*value));
-                *count = count.saturating_add(1);
-            }
-        }
-        if counts.iter().all(|count| *count > 0) {
-            let values = sums
-                .into_iter()
-                .zip(counts)
-                .map(|(sum, count)| u64::try_from(sum / u128::from(count)).unwrap_or(u64::MAX))
-                .collect();
-            return Timeline { elapsed_ms, values };
-        }
-    }
-    Timeline {
-        elapsed_ms,
-        values: vec![first_value],
-    }
-}
-
-pub(crate) fn moving_average(values: &[u64], radius: usize) -> Vec<u64> {
-    values
-        .iter()
-        .enumerate()
-        .map(|(index, _value)| {
-            let start = index.saturating_sub(radius);
-            let end = index
-                .saturating_add(radius)
-                .saturating_add(1)
-                .min(values.len());
-            let (sum, count) = values
-                .iter()
-                .skip(start)
-                .take(end.saturating_sub(start))
-                .fold((0_u128, 0_u128), |(sum, count), value| {
-                    (sum.saturating_add(u128::from(*value)), count + 1)
-                });
-            u64::try_from(sum / count.max(1)).unwrap_or(u64::MAX)
-        })
-        .collect()
 }
 
 fn render_telemetry_issues(output: &mut String, runs: &[RunData]) -> Result<()> {
@@ -1342,108 +1521,6 @@ fn render_category_chart(
     Ok(())
 }
 
-fn render_cpu_timeline_chart(
-    output: &mut String,
-    title: &str,
-    description: &str,
-    x_maximum: u64,
-    values: &[u64],
-) -> Result<()> {
-    render_timeline_chart(
-        output,
-        title,
-        description,
-        x_maximum,
-        "CPU (%)",
-        100,
-        &[ChartSeries {
-            name: "SFU process",
-            values,
-        }],
-    )
-}
-
-fn render_timeline_chart(
-    output: &mut String,
-    title: &str,
-    description: &str,
-    x_maximum: u64,
-    y_axis: &str,
-    minimum: u64,
-    series: &[ChartSeries<'_>],
-) -> Result<()> {
-    let value_count = series
-        .first()
-        .context("line chart series cannot be empty")?
-        .values
-        .len();
-    ensure!(value_count > 0, "line chart values cannot be empty");
-    ensure!(
-        series.iter().all(|line| line.values.len() == value_count),
-        "line chart series lengths must match"
-    );
-    ensure!(
-        series.len() <= LINE_COLORS.len(),
-        "line chart has more lines than its color palette"
-    );
-    ensure!(
-        value_count <= CPU_TIMELINE_POINTS,
-        "line chart exceeds the timeline point limit"
-    );
-    if value_count == 1 {
-        writeln!(
-            output,
-            "The {title} chart is omitted because fewer than two telemetry buckets are available. The sampled value remains in the telemetry table.\n"
-        )?;
-        return Ok(());
-    }
-    if series
-        .iter()
-        .any(|line| line.values.iter().any(|value| *value > MAX_MERMAID_INTEGER))
-    {
-        writeln!(
-            output,
-            "The {title} chart is omitted because a value exceeds Mermaid's exact-integer range. Numeric values remain below.\n"
-        )?;
-        return Ok(());
-    }
-    let maximum = chart_axis_max(series.iter().flat_map(|line| line.values.iter()), minimum);
-    writeln!(output, "{description}\n")?;
-    write!(output, "Series colors: ")?;
-    for (index, (line, (color, hex))) in series.iter().zip(LINE_COLORS).enumerate() {
-        if index > 0 {
-            write!(output, ". ")?;
-        }
-        write!(output, "{color} (`{hex}`) = {}", line.name)?;
-    }
-    writeln!(output, ".\n")?;
-    writeln!(output, "```mermaid")?;
-    writeln!(output, "---")?;
-    writeln!(output, "config:")?;
-    writeln!(output, "  themeVariables:")?;
-    writeln!(output, "    xyChart:")?;
-    let palette = LINE_COLORS
-        .iter()
-        .map(|(_name, hex)| *hex)
-        .collect::<Vec<_>>()
-        .join(", ");
-    writeln!(output, "      plotColorPalette: \"{palette}\"")?;
-    writeln!(output, "---")?;
-    writeln!(output, "xychart-beta")?;
-    writeln!(output, "    accTitle: {title}")?;
-    writeln!(output, "    accDescr: {description}")?;
-    writeln!(output, "    title \"{title}\"")?;
-    writeln!(output, "    x-axis \"elapsed (s)\" 0 --> {x_maximum}")?;
-    writeln!(output, "    y-axis \"{y_axis}\" 0 --> {maximum}")?;
-    for line in series {
-        write!(output, "    line [")?;
-        write_values(output, line.values)?;
-        writeln!(output, "]")?;
-    }
-    writeln!(output, "```\n")?;
-    Ok(())
-}
-
 fn write_values(output: &mut String, values: &[u64]) -> Result<()> {
     for (index, value) in values.iter().enumerate() {
         if index > 0 {
@@ -1546,6 +1623,18 @@ pub(crate) fn pacing_valid(result: &ScenarioResult) -> bool {
         ScenarioSpec::VideoGallery { .. } => 34,
     };
     result.max_send_lag_ms <= interval_ms
+}
+
+pub(crate) fn workload_matches(baseline: &RunData, comparison: &RunData) -> bool {
+    let baseline = &baseline.result;
+    let comparison = &comparison.result;
+    baseline.schema_version == comparison.schema_version
+        && baseline.profile == comparison.profile
+        && baseline.scenario == comparison.scenario
+        && baseline.server_policy == comparison.server_policy
+        && baseline.plan == comparison.plan
+        && baseline.offered_packets == comparison.offered_packets
+        && baseline.offered_payload_bytes == comparison.offered_payload_bytes
 }
 
 pub(crate) fn delivery_rate(result: &ScenarioResult) -> u64 {
