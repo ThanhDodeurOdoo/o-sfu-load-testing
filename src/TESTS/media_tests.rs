@@ -1,8 +1,11 @@
 use std::time::Duration;
 
+use o_sfu_rfc::rtp::vp8;
+
 use super::{
     AUDIO_FRAME_INTERVAL, AudioSource, MediaTimeline, OPUS_HYBRID_FULLBAND_20_MS_CONFIG,
-    PacketPhase, PayloadKind, VIDEO_FRAME_INTERVAL, VideoLayer, VideoSource, inspect_payload,
+    PacketPhase, PayloadKind, VIDEO_FRAME_INTERVAL, VP8_DESCRIPTOR_LEN, VideoLayer, VideoSource,
+    inspect_payload,
 };
 use crate::AUDIO_PACKET_PAYLOAD_BYTES;
 
@@ -47,6 +50,8 @@ fn warmup_and_measured_audio_have_distinct_identity() -> anyhow::Result<()> {
 #[test]
 fn video_source_emits_frame_bursts_for_both_layers() {
     let packets = VideoSource::new(7).next_frame(PacketPhase::Measured, 0);
+    let low_keyframe_prefix = [0x30, 0x00, 0x00, 0x9d, 0x01, 0x2a, 0x40, 0x01, 0xb4, 0x00];
+    let high_keyframe_prefix = [0x30, 0x00, 0x00, 0x9d, 0x01, 0x2a, 0x00, 0x05, 0xd0, 0x02];
     let low = packets
         .iter()
         .filter(|packet| packet.layer == VideoLayer::Low)
@@ -58,6 +63,33 @@ fn video_source_emits_frame_bursts_for_both_layers() {
 
     assert_eq!(low, 2);
     assert_eq!(high, 20);
+    assert_eq!(
+        packets
+            .iter()
+            .filter(|packet| vp8::payload_starts_keyframe(&packet.payload))
+            .count(),
+        2
+    );
+    assert!(
+        packets
+            .iter()
+            .filter(|packet| {
+                packet
+                    .payload
+                    .first()
+                    .is_some_and(|descriptor| descriptor & vp8::S_BIT != 0)
+            })
+            .all(|packet| {
+                let keyframe_prefix = match packet.layer {
+                    VideoLayer::Low => low_keyframe_prefix.as_slice(),
+                    VideoLayer::High => high_keyframe_prefix.as_slice(),
+                };
+                packet
+                    .payload
+                    .get(VP8_DESCRIPTOR_LEN..VP8_DESCRIPTOR_LEN + keyframe_prefix.len())
+                    == Some(keyframe_prefix)
+            })
+    );
     assert!(packets.iter().all(|packet| {
         inspect_payload(&packet.payload).is_ok_and(|inspection| inspection.payload_matches)
     }));

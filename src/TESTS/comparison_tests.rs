@@ -52,7 +52,7 @@ fn comparison_pairs_mixed_conference_contracts() -> anyhow::Result<()> {
 
     assert!(report.contains("| PASS | IDENTICAL | VALID | INVALID | 1 | 0 |"));
     assert!(report.contains(
-        "| mixed-conference-1x20-5a-4v-10s | opus-vp8-mixed-conference-v1 | 171 | 149,180 | 10 s |"
+        "| mixed-conference-1x20-5a-4v-10s | opus-vp8-mixed-conference-v2 | 171 | 149,180 | 10 s |"
     ));
     assert!(report.contains("## Per-stream media load"));
     Ok(())

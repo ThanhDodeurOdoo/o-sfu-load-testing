@@ -18,6 +18,13 @@ const IDENTITY_MAGIC: [u8; 4] = *b"OSFU";
 const IDENTITY_VERSION: u8 = 1;
 const IDENTITY_HEADER_LEN: usize = 22;
 const VP8_DESCRIPTOR_LEN: usize = 6;
+const VP8_KEYFRAME_PREFIX_LEN: usize = 10;
+const VP8_LOW_KEYFRAME_PREFIX: [u8; VP8_KEYFRAME_PREFIX_LEN] =
+    [0x30, 0x00, 0x00, 0x9d, 0x01, 0x2a, 0x40, 0x01, 0xb4, 0x00];
+const VP8_HIGH_KEYFRAME_PREFIX: [u8; VP8_KEYFRAME_PREFIX_LEN] =
+    [0x30, 0x00, 0x00, 0x9d, 0x01, 0x2a, 0x00, 0x05, 0xd0, 0x02];
+const VP8_INTERFRAME_PREFIX: [u8; 1] = [rtp::vp8::INTERFRAME_BIT];
+const MAX_IDENTITY_OFFSET: usize = VP8_DESCRIPTOR_LEN + VP8_KEYFRAME_PREFIX_LEN;
 const OPUS_HYBRID_FULLBAND_20_MS_CONFIG: u8 = 15;
 const ONE_FRAME_TOC: u8 =
     (OPUS_HYBRID_FULLBAND_20_MS_CONFIG << 3) | opus::frame_count_code::ONE_FRAME;
@@ -414,15 +421,22 @@ fn append_video_layer(
         };
         *next_ordinal = next_ordinal.wrapping_add(1);
         let descriptor = vp8_descriptor(picture_id, tl0_pic_idx, fragment == 0);
-        let frame_tag = (fragment == 0).then_some(if keyframe {
-            0
+        let prefix = if fragment == 0 {
+            let frame_prefix: &[u8] = if keyframe {
+                match layer {
+                    VideoLayer::Low => &VP8_LOW_KEYFRAME_PREFIX,
+                    VideoLayer::High => &VP8_HIGH_KEYFRAME_PREFIX,
+                }
+            } else {
+                &VP8_INTERFRAME_PREFIX
+            };
+            descriptor
+                .into_iter()
+                .chain(frame_prefix.iter().copied())
+                .collect()
         } else {
-            rtp::vp8::INTERFRAME_BIT
-        });
-        let prefix = frame_tag.map_or_else(
-            || descriptor.to_vec(),
-            |frame_tag| descriptor.into_iter().chain([frame_tag]).collect(),
-        );
+            descriptor.to_vec()
+        };
         let independent = keyframe && fragment == 0;
         let mut frame_mark = u32::from(frame_marking::BASE_LAYER_ID) << 24;
         if fragment == 0 {
@@ -490,7 +504,7 @@ fn encoded_payload(identity: PacketIdentity, payload_len: usize, prefix: &[u8]) 
 pub fn inspect_payload(payload: &[u8]) -> Result<PayloadInspection> {
     let identity_offset = payload
         .windows(IDENTITY_MAGIC.len())
-        .take(16)
+        .take(MAX_IDENTITY_OFFSET + 1)
         .position(|window| window == IDENTITY_MAGIC)
         .context("RTP payload has no load identity")?;
     let header = payload

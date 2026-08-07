@@ -60,6 +60,9 @@ fn report_describes_mixed_conference_and_exact_media_units() -> anyhow::Result<(
     assert!(report.contains(
         "| One VP8 camera publication, two RTP streams | 2-second GOP | 453.5 | 3,868,800 bit/s |"
     ));
+    assert!(report.contains(
+        "Each first keyframe fragment carries the complete ten-byte VP8 uncompressed prefix"
+    ));
     assert!(report.contains("| Streams | Total media consumers | Offered packets |"));
     assert!(report.contains("10 \u{d7} (60 - 1) = 590"));
     assert!(report.contains(

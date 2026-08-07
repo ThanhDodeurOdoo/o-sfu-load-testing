@@ -266,8 +266,8 @@ impl ScenarioSpec {
         match self {
             Self::Smoke { .. } => "opus-fanout-smoke-v3",
             Self::AudioMesh { .. } => "opus-20ms-audio-mesh-v2",
-            Self::VideoGallery { .. } => "vp8-simulcast-gallery-v1",
-            Self::MixedConference { .. } => "opus-vp8-mixed-conference-v1",
+            Self::VideoGallery { .. } => "vp8-simulcast-gallery-v2",
+            Self::MixedConference { .. } => "opus-vp8-mixed-conference-v2",
         }
     }
 

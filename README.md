@@ -64,7 +64,10 @@ and [4 Mbit/s high RID](https://github.com/ThanhDodeurOdoo/o-sfu/blob/9cae4cbaa1
 defaults. The high RID is a production near-cap stress profile rather than an
 ordinary camera average. The fixed GOP adds conservative keyframe pressure.
 Both RIDs use VP8 payload descriptors, PictureID, TL0PICIDX and marker
-semantics. [RFC 7741](https://www.rfc-editor.org/rfc/rfc7741.html#section-4.4)
+semantics. Each first keyframe fragment carries the complete ten-byte VP8
+uncompressed prefix with its sync code and 320 by 180 low or 1,280 by 720 high
+dimensions. [RFC 6386](https://www.rfc-editor.org/rfc/rfc6386.html#section-9.1)
+defines that prefix. [RFC 7741](https://www.rfc-editor.org/rfc/rfc7741.html#section-4.4)
 defines VP8 frame fragmentation across RTP packets. The largest 1,100 B RTP
 payload leaves 180 B for IPv6, UDP, RTP, SRTP and negotiated extensions beneath
 the 1,280 B IPv6 effective MTU discussed by
