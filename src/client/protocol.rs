@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
 use o_sfu_protocol::{
-    host::{Command, CommandBatch, ProtocolCore},
+    host::{Command, NegotiationKind, ProtocolCore},
     wire::{DownloadStates, StreamType, UserId, VideoLayoutIntent},
 };
 use tokio::{
@@ -151,8 +151,8 @@ impl ProtocolPeer {
         Box::pin(self.run_commands(commands)).await
     }
 
-    async fn run_commands(&mut self, commands: CommandBatch) -> Result<()> {
-        let mut pending: VecDeque<_> = commands.into_vec().into();
+    async fn run_commands(&mut self, commands: Vec<Command>) -> Result<()> {
+        let mut pending: VecDeque<_> = commands.into();
         while let Some(command) = pending.pop_front() {
             match command {
                 Command::Connect { url } => {
@@ -160,16 +160,13 @@ impl ProtocolPeer {
                         .await
                         .context("failed to connect to the o-sfu WebSocket")?;
                     self.websocket = Some(websocket);
-                    pending.extend(self.core.on_ws_open().into_vec());
+                    pending.extend(self.core.on_ws_open());
                 }
-                Command::SendWebSocket(frame) => {
+                Command::SendWebSocket { frame } => {
                     self.websocket_mut()?
                         .send(Message::Text(frame.into()))
                         .await
                         .context("failed to send an o-sfu signaling frame")?;
-                }
-                Command::CreatePeerConnection => {
-                    self.rtc = Some(Box::pin(RtcPeer::bind()).await?);
                 }
                 Command::ClosePeerConnection => {
                     self.rtc = None;
@@ -180,11 +177,14 @@ impl ProtocolPeer {
                     sdp,
                     upload_slots,
                 } => {
+                    // Only initial offers may replace the RTC peer so renegotiation preserves ICE/DTLS.
+                    if kind == NegotiationKind::Offer {
+                        self.rtc = Some(Box::pin(RtcPeer::bind()).await?);
+                    }
                     let answer = self.rtc_mut()?.answer_offer(&sdp, &upload_slots).await?;
                     pending.extend(
                         self.core
-                            .submit_negotiation_answer(&request_id, kind, answer)
-                            .into_vec(),
+                            .submit_negotiation_answer(&request_id, kind, answer),
                     );
                     self.negotiation_count += 1;
                 }
@@ -200,10 +200,20 @@ impl ProtocolPeer {
                         .await
                         .context("failed to close the o-sfu WebSocket")?;
                 }
+                Command::BeginPendingRequest { request } => {
+                    let _ = self
+                        .timers
+                        .insert(request.timeout_timer_id, request.timeout_ms);
+                }
+                Command::CompletePendingRequest {
+                    timeout_timer_id, ..
+                } => {
+                    let _ = self.timers.remove(&timeout_timer_id);
+                }
                 Command::EmitStateChange { .. }
                 | Command::EmitEvent { .. }
-                | Command::BeginPendingRequest { .. }
-                | Command::ResolvePendingRequest { .. } => {}
+                | Command::SetAvailableFeatures { .. }
+                | Command::SetRecordingState { .. } => {}
             }
         }
         Ok(())

@@ -888,6 +888,8 @@ async fn create_room(base_url: &str, room_index: u32) -> Result<String> {
                 ..RegisteredJwtClaims::default()
             },
             key: Some(ROOM_KEY.to_owned()),
+            // Participant tokens use ROOM_KEY directly, without seed derivation.
+            key_seed: None,
         },
         AUTH_KEY,
     )

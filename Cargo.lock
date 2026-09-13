@@ -187,7 +187,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90"
 dependencies = [
  "axum-core",
- "base64",
+ "base64 0.22.1",
  "bytes",
  "form_urlencoded",
  "futures-util",
@@ -246,6 +246,12 @@ name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "base64ct"
@@ -873,7 +879,7 @@ version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96547c2556ec9d12fb1578c4eaf448b04993e7fb79cbaad930a656880a6bdfa0"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures-channel",
  "futures-util",
@@ -1026,7 +1032,20 @@ checksum = "5cff4e962dd367e3b1c478f67c24a35e7120ec767090cb61305b855db9a529c4"
 dependencies = [
  "crc",
  "serde",
- "str0m-proto",
+ "str0m-proto 0.6.0",
+ "subtle",
+ "tracing",
+]
+
+[[package]]
+name = "is"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d08f9118d003d441f79c1070e84d0a2a89f35721ca8ae0cd5e1f9026dc4a2517"
+dependencies = [
+ "crc",
+ "serde",
+ "str0m-proto 0.7.0",
  "subtle",
  "tracing",
 ]
@@ -1042,6 +1061,15 @@ name = "itertools"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
+dependencies = [
+ "either",
+]
+
+[[package]]
+name = "itertools"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b4baf93f58d4425749ca49a51c50ebab072c5df6994d08fed93541c331481dc"
 dependencies = [
  "either",
 ]
@@ -1205,12 +1233,12 @@ dependencies = [
 
 [[package]]
 name = "o-sfu"
-version = "0.8.0"
-source = "git+https://github.com/ThanhDodeurOdoo/o-sfu?branch=master#9cae4cbaa196564fbebee033dc4e9e772b714124"
+version = "0.11.4"
+source = "git+https://github.com/ThanhDodeurOdoo/o-sfu?branch=master#b60da1d584f786ced8aaeec2e1b12ee17ce18207"
 dependencies = [
  "anyhow",
  "axum",
- "base64",
+ "base64 0.23.1",
  "futures-util",
  "hmac",
  "o-sfu-core",
@@ -1230,18 +1258,19 @@ dependencies = [
 
 [[package]]
 name = "o-sfu-core"
-version = "0.8.0"
-source = "git+https://github.com/ThanhDodeurOdoo/o-sfu?branch=master#9cae4cbaa196564fbebee033dc4e9e772b714124"
+version = "0.11.4"
+source = "git+https://github.com/ThanhDodeurOdoo/o-sfu?branch=master#b60da1d584f786ced8aaeec2e1b12ee17ce18207"
 dependencies = [
  "bitflags 2.13.1",
  "futures-util",
+ "itertools 0.15.0",
  "o-sfu-model",
  "o-sfu-rfc",
  "o-sfu-router",
  "o-sfu-telemetry",
  "serde",
  "serde_json",
- "str0m",
+ "str0m 0.23.1",
  "thiserror",
  "time",
  "tokio",
@@ -1265,7 +1294,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "str0m",
+ "str0m 0.21.0",
  "tikv-jemallocator",
  "tokio",
  "tokio-tungstenite 0.30.0",
@@ -1273,8 +1302,8 @@ dependencies = [
 
 [[package]]
 name = "o-sfu-model"
-version = "0.8.0"
-source = "git+https://github.com/ThanhDodeurOdoo/o-sfu?branch=master#9cae4cbaa196564fbebee033dc4e9e772b714124"
+version = "0.11.4"
+source = "git+https://github.com/ThanhDodeurOdoo/o-sfu?branch=master#b60da1d584f786ced8aaeec2e1b12ee17ce18207"
 dependencies = [
  "serde",
  "serde_json",
@@ -1282,30 +1311,31 @@ dependencies = [
 
 [[package]]
 name = "o-sfu-protocol"
-version = "0.8.0"
-source = "git+https://github.com/ThanhDodeurOdoo/o-sfu?branch=master#9cae4cbaa196564fbebee033dc4e9e772b714124"
+version = "0.11.4"
+source = "git+https://github.com/ThanhDodeurOdoo/o-sfu?branch=master#b60da1d584f786ced8aaeec2e1b12ee17ce18207"
 dependencies = [
  "o-sfu-model",
  "o-sfu-rfc",
  "serde",
  "serde-wasm-bindgen",
  "serde_json",
+ "thiserror",
  "wasm-bindgen",
 ]
 
 [[package]]
 name = "o-sfu-rfc"
-version = "0.8.0"
-source = "git+https://github.com/ThanhDodeurOdoo/o-sfu?branch=master#9cae4cbaa196564fbebee033dc4e9e772b714124"
+version = "0.11.4"
+source = "git+https://github.com/ThanhDodeurOdoo/o-sfu?branch=master#b60da1d584f786ced8aaeec2e1b12ee17ce18207"
 dependencies = [
- "base64",
+ "base64 0.23.1",
  "serde",
 ]
 
 [[package]]
 name = "o-sfu-router"
-version = "0.8.0"
-source = "git+https://github.com/ThanhDodeurOdoo/o-sfu?branch=master#9cae4cbaa196564fbebee033dc4e9e772b714124"
+version = "0.11.4"
+source = "git+https://github.com/ThanhDodeurOdoo/o-sfu?branch=master#b60da1d584f786ced8aaeec2e1b12ee17ce18207"
 dependencies = [
  "o-sfu-model",
  "o-sfu-rfc",
@@ -1314,8 +1344,8 @@ dependencies = [
 
 [[package]]
 name = "o-sfu-telemetry"
-version = "0.8.0"
-source = "git+https://github.com/ThanhDodeurOdoo/o-sfu?branch=master#9cae4cbaa196564fbebee033dc4e9e772b714124"
+version = "0.11.4"
+source = "git+https://github.com/ThanhDodeurOdoo/o-sfu?branch=master#b60da1d584f786ced8aaeec2e1b12ee17ce18207"
 dependencies = [
  "anyhow",
  "o-sfu-model",
@@ -1542,7 +1572,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -1651,7 +1681,7 @@ version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures-channel",
  "futures-core",
@@ -1717,9 +1747,9 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "sctp-proto"
-version = "0.10.2"
+version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "801033d212d17c3ad6b523c3fb3a41de323707b10b75cb437d05d5eff3b15204"
+checksum = "a22cbe1d867f74fc377b9e63ac74457ea7dcfda23a0deaba6af083ad7e060019"
 dependencies = [
  "bytes",
  "crc",
@@ -1942,11 +1972,32 @@ dependencies = [
  "combine",
  "dimpl",
  "fastrand",
- "is",
+ "is 0.10.0",
  "sctp-proto",
  "serde",
- "str0m-aws-lc-rs",
- "str0m-proto",
+ "str0m-aws-lc-rs 0.5.0",
+ "str0m-proto 0.6.0",
+ "subtle",
+ "time",
+ "tracing",
+]
+
+[[package]]
+name = "str0m"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8522aa06c731cfdc1488e32de7fcebcfc8d9d86d49a6ecc95a64779fe7b545f2"
+dependencies = [
+ "arrayvec",
+ "base64ct",
+ "combine",
+ "dimpl",
+ "fastrand",
+ "is 0.11.0",
+ "sctp-proto",
+ "serde",
+ "str0m-aws-lc-rs 0.6.0",
+ "str0m-proto 0.7.0",
  "subtle",
  "time",
  "tracing",
@@ -1960,7 +2011,19 @@ checksum = "67e3e6efb440ad95c9370171da8fb033684f8237a4d4d4987887774149547b0d"
 dependencies = [
  "aws-lc-rs",
  "dimpl",
- "str0m-proto",
+ "str0m-proto 0.6.0",
+ "time",
+]
+
+[[package]]
+name = "str0m-aws-lc-rs"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73269314334fc6bfa8024f09dd652b9f5068360bf623c871e3d8d18e26d8035a"
+dependencies = [
+ "aws-lc-rs",
+ "dimpl",
+ "str0m-proto 0.7.0",
  "time",
 ]
 
@@ -1969,6 +2032,20 @@ name = "str0m-proto"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c99c3d805532aebd04585ba54e97e958c382759fb8f52256e289a49233f7e05b"
+dependencies = [
+ "base64ct",
+ "dimpl",
+ "fastrand",
+ "serde",
+ "subtle",
+ "time",
+]
+
+[[package]]
+name = "str0m-proto"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e8f3d99f2cf6c76a502e45feb896ea71e54787ede8744bcdb215acfbfcb905dd"
 dependencies = [
  "base64ct",
  "dimpl",
